@@ -1,0 +1,60 @@
+#!/bin/bash
+# Coding Agent HTTP Server Launcher
+# Usage: ./coder-http [PORT]
+#
+# Starts an HTTP server exposing the Coding Agent API on the specified port (default: 8080)
+#
+# Endpoints:
+#   GET  /           - API info
+#   GET  /health     - Health check
+#   GET  /status     - Agent status
+#   POST /chat       - Send message to agent
+#   POST /session    - Create session
+#   GET  /session/:id - Get session info
+#   GET  /tools      - List tools
+#   POST /tools/:name - Execute tool
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/_build/default/lib"
+
+# Parse arguments
+PORT=${1:-8080}
+HOST=${OLLAMA_HOST:-"http://localhost:11434"}
+MODEL=${OLLAMA_MODEL:-"glm-5:cloud"}
+
+# Check if build exists
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "Build not found. Running rebar3 compile..."
+    cd "$SCRIPT_DIR"
+    rebar3 compile
+    if [ $? -ne 0 ]; then
+        echo "Compilation failed!"
+        exit 1
+    fi
+fi
+
+# Check Erlang
+if ! command -v erl &> /dev/null; then
+    echo "Error: Erlang not found. Please install Erlang/OTP."
+    exit 1
+fi
+
+echo "Starting Coding Agent HTTP server on port $PORT..."
+echo ""
+echo "Endpoints:"
+echo "  GET  /           - API info"
+echo "  GET  /health     - Health check"
+echo "  GET  /status     - Agent status"
+echo "  POST /chat       - Send message"
+echo "  GET  /tools      - List tools"
+echo "  POST /tools/name - Execute tool"
+echo ""
+echo "Example:"
+echo "  curl http://localhost:$PORT/status"
+echo "  curl -X POST -H 'Content-Type: application/json' -d '{\"message\":\"hello\"}' http://localhost:$PORT/chat"
+echo ""
+
+# Start HTTP server
+cd "$SCRIPT_DIR"
+exec erl -noshell -pa "$BUILD_DIR"/*/ebin \
+    -eval "application:set_env(coding_agent, model, \"$MODEL\"), application:set_env(coding_agent, ollama_host, \"$HOST\"), application:ensure_all_started(coding_agent), coding_agent_http:start_link([{port, $PORT}]), io:format(\"HTTP server running on port ~p~nPress Ctrl+C to stop~n\", [$PORT]), receive stop -> ok end."

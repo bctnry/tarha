@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coding Agent Chat</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🤖 Coding Agent</h1>
+            <div class="status" id="status">
+                <span class="status-dot"></span>
+                <span class="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <main class="chat-container">
+            <div class="messages" id="messages">
+                <div class="message system">
+                    <div class="message-content">
+                        Welcome! I'm a coding agent. I can help you with:
+                        <ul>
+                            <li>Reading, writing, and editing files</li>
+                            <li>Running build and test commands</li>
+                            <li>Git operations</li>
+                            <li>Code search and refactoring</li>
+                            <li>Debugging and code review</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <div class="thinking" id="thinking" style="display: none;">
+                <div class="thinking-content" id="thinking-content"></div>
+            </div>
+        </main>
+
+        <footer class="input-container">
+            <form id="chat-form">
+                <textarea 
+                    id="message-input" 
+                    placeholder="Ask me anything about coding..."
+                    rows="1"
+                    autofocus
+                ></textarea>
+                <button type="submit" id="send-btn">
+                    <svg viewBox="0 0 24 24" width="24" height="24">
+                        <path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                    </svg>
+                </button>
+            </form>
+            <div class="tools-bar">
+                <button type="button" id="tools-btn" title="Show available tools">
+                    📦 Tools
+                </button>
+                <button type="button" id="clear-btn" title="Clear conversation">
+                    🗑️ Clear
+                </button>
+                <button type="button" id="status-btn" title="Show status">
+                    📊 Status
+                </button>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Tools Modal -->
+    <div class="modal" id="tools-modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Available Tools</h2>
+                <button class="modal-close" id="tools-close">&times;</button>
+            </div>
+            <div class="modal-body" id="tools-list">
+                Loading...
+            </div>
+        </div>
+    </div>
+
+    <!-- Status Modal -->
+    <div class="modal" id="status-modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Agent Status</h2>
+                <button class="modal-close" id="status-close">&times;</button>
+            </div>
+            <div class="modal-body" id="status-content">
+                Loading...
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

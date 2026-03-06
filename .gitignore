@@ -1,0 +1,39 @@
+# Build artifacts
+_build/
+rebar.lock
+*.beam
+*.o
+*.plt
+
+# Erlang
+.erlang.cookie
+*.erl~
+*.hrl~
+
+# Runtime files
+memory/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js (if any web frontend)
+node_modules/
+npm-debug.log
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+tmp/
+tmp.*/
+erl_crash.dump

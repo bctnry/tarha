@@ -1,0 +1,78 @@
+#!/bin/bash
+# Coding Agent Zulip Bot Launcher
+# Usage: ./coder-zulip [config.yaml]
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/_build/default/lib"
+CONFIG_FILE="${1:-$SCRIPT_DIR/config.yaml}"
+
+# Check if build exists
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "Build not found. Running rebar3 compile..."
+    cd "$SCRIPT_DIR"
+    rebar3 compile
+    if [ $? -ne 0 ]; then
+        echo "Compilation failed!"
+        exit 1
+    fi
+fi
+
+# Check Erlang
+if ! command -v erl &> /dev/null; then
+    echo "Error: Erlang not found. Please install Erlang/OTP."
+    exit 1
+fi
+
+# Check config file
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: Config file not found: $CONFIG_FILE"
+    echo ""
+    echo "Create config.yaml with:"
+    echo "  zulip:"
+    echo "    enabled: true"
+    echo "    site: https://your-org.zulipchat.com"
+    echo "    bot_email: your-bot@example.com"
+    echo "    api_key: your-api-key"
+    exit 1
+fi
+
+# Parse config (simple yaml parsing)
+OLLAMA_HOST=$(grep -E "^  host:" "$CONFIG_FILE" | head -1 | sed 's/.*: *//' | tr -d '"')
+OLLAMA_MODEL=$(grep -E "^  model:" "$CONFIG_FILE" | head -1 | sed 's/.*: *//' | tr -d '"')
+
+ZULIP_SITE=$(grep -E "^  site:" "$CONFIG_FILE" | head -1 | sed 's/.*: *//' | tr -d '"')
+ZULIP_EMAIL=$(grep -E "^  bot_email:" "$CONFIG_FILE" | head -1 | sed 's/.*: *//' | tr -d '"')
+ZULIP_KEY=$(grep -E "^  api_key:" "$CONFIG_FILE" | head -1 | sed 's/.*: *//' | tr -d '"')
+
+HTTP_PORT=$(grep -E "^  port:" "$CONFIG_FILE" | head -1 | sed 's/.*: *//')
+
+echo "Starting Coding Agent Zulip Bot..."
+echo ""
+if [ -n "$OLLAMA_HOST" ]; then
+    echo "Ollama: $OLLAMA_HOST"
+fi
+if [ -n "$OLLAMA_MODEL" ]; then
+    echo "Model: $OLLAMA_MODEL"
+fi
+echo "Zulip: $ZULIP_SITE"
+echo "Bot: $ZULIP_EMAIL"
+echo ""
+
+# Start the agent with Zulip integration
+cd "$SCRIPT_DIR"
+exec erl -noshell -pa "$BUILD_DIR"/*/ebin \
+    -eval "
+application:set_env(coding_agent, ollama_host, \"$OLLAMA_HOST\"),
+application:set_env(coding_agent, model, \"$OLLAMA_MODEL\"),
+application:set_env(coding_agent, zulip_config, #{
+    site => <<\"$ZULIP_SITE\">>,
+    bot_email => <<\"$ZULIP_EMAIL\">>,
+    api_key => <<\"$ZULIP_KEY\">>
+}),
+application:ensure_all_started(coding_agent),
+case whereis(coding_agent_zulip) of
+    undefined -> io:format(\"Zulip not started. Check config.~n\");
+    _ -> io:format(\"Zulip bot started.~n\")
+end,
+receive stop -> ok end.
+"

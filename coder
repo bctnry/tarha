@@ -1,0 +1,94 @@
+#!/bin/bash
+# Coding Agent REPL Launcher
+# Usage: ./coder [options]
+#
+# Options:
+#   --model <name>       Set model (default: glm-5:cloud)
+#   --host <url>         Set Ollama host (default: http://localhost:11434)
+#   --no-color           Disable colored output
+#   -h, --help           Show this help
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/_build/default/lib"
+
+# Parse arguments
+MODEL=${OLLAMA_MODEL:-"glm-5:cloud"}
+HOST=${OLLAMA_HOST:-"http://localhost:11434"}
+COLOR=1
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --host)
+            HOST="$2"
+            shift 2
+            ;;
+        --no-color)
+            COLOR=0
+            shift
+            ;;
+        -h|--help)
+            echo "Coding Agent REPL - Interactive Coding Assistant"
+            echo ""
+            echo "Usage: $0 [options]"
+            echo ""
+            echo "Options:"
+            echo "  --model <name>       Set model (default: glm-5:cloud)"
+            echo "  --host <url>         Set Ollama host (default: http://localhost:11434)"
+            echo "  --no-color           Disable colored output"
+            echo "  -h, --help           Show this help"
+            echo ""
+            echo "Environment Variables:"
+            echo "  OLLAMA_MODEL         Override default model"
+            echo "  OLLAMA_HOST          Override default host"
+            echo ""
+            echo "Examples:"
+            echo "  $0                           # Start REPL with defaults"
+            echo "  $0 --model llama3            # Use different model"
+            echo "  $0 --host http://remote:11434"
+            echo ""
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Check if build exists
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "Build not found. Running rebar3 compile..."
+    cd "$SCRIPT_DIR"
+    rebar3 compile
+    if [ $? -ne 0 ]; then
+        echo "Compilation failed!"
+        exit 1
+    fi
+fi
+
+# Check Erlang
+if ! command -v erl &> /dev/null; then
+    echo "Error: Erlang not found. Please install Erlang/OTP."
+    exit 1
+fi
+
+# Check Ollama connectivity
+if command -v curl &> /dev/null; then
+    if ! curl -s "$HOST/api/tags" > /dev/null 2>&1; then
+        echo "Warning: Cannot connect to Ollama at $HOST"
+        echo "Make sure Ollama is running: ollama serve"
+    fi
+fi
+
+# Set environment
+export OLLAMA_MODEL="$MODEL"
+export OLLAMA_HOST="$HOST"
+
+# Start REPL with stdin support
+cd "$SCRIPT_DIR"
+exec erl -noshell -pa "$BUILD_DIR"/*/ebin \
+    -eval "application:set_env(coding_agent, model, \"$MODEL\"), application:set_env(coding_agent, ollama_host, \"$HOST\"), application:ensure_all_started(coding_agent), coding_agent_repl:start(), halt()."
