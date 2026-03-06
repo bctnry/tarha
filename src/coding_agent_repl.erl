@@ -485,16 +485,45 @@ process_message(SessionId, History, Input) ->
             {continue, NewHistory};
         {error, Reason} ->
             io:format("Error: ~p~n~n", [Reason]),
-            report_error(Reason),
+            report_error(Reason, SessionId),
             {continue, NewHistory}
     catch
         Type:Error:Stacktrace ->
             io:format("~n⚠ Session crashed: ~p:~p~n", [Type, Error]),
-            report_crash(Type, Error, Stacktrace),
+            report_crash(Type, Error, Stacktrace, SessionId),
             io:format("Creating new session and continuing...~n"),
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
             {continue, NewHistory}
+    end.
+
+report_error(Reason, SessionId) ->
+    % Don't log HTTP/API errors to crash report - they're handled by retry
+    case is_http_error(Reason) of
+        true ->
+            io:format("(API error, will retry automatically)~n");
+        false ->
+            io:format("Error: ~p~n", [Reason]),
+            case whereis(coding_agent_healer) of
+                undefined -> ok;
+                _ ->
+                    Stacktrace = try throw(fake) catch _:_:St -> St end,
+                    coding_agent_healer:report_crash(repl_error, Reason, Stacktrace, #{session_id => SessionId}),
+                    io:format("Error logged.~n")
+            end
+    end.
+
+report_crash(Type, Error, Stacktrace, SessionId) ->
+    case whereis(coding_agent_healer) of
+        undefined -> ok;
+        _ ->
+            coding_agent_healer:report_crash(repl_crash, {Type, Error}, Stacktrace, #{session_id => SessionId}),
+            io:format("Crash logged.~n"),
+            {_, CrashAnalysis} = coding_agent_healer:analyze_crash(Type, Stacktrace),
+            case maps:get(suggested_fix, CrashAnalysis, #{}) of
+                #{hint := Hint} -> io:format("Suggestion: ~s~n", [Hint]);
+                _ -> ok
+            end
     end.
 
 report_error(Reason) ->

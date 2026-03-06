@@ -1,7 +1,7 @@
 -module(coding_agent_healer).
 -behaviour(gen_server).
 -export([start_link/0, analyze_crash/2, auto_fix/1, get_crashes/0, clear_crashes/0, 
-         report_crash/3, get_recent_crashes/0, write_crash_report/1,
+         report_crash/3, report_crash/4, get_recent_crashes/0, write_crash_report/1,
          list_crash_reports/0, read_crash_report/1, delete_crash_report/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -189,6 +189,9 @@ clear_crashes() ->
     gen_server:call(?MODULE, clear_crashes).
 
 report_crash(Module, Reason, Stacktrace) ->
+    report_crash(Module, Reason, Stacktrace, #{}).
+
+report_crash(Module, Reason, Stacktrace, Opts) ->
     % Run analysis
     Analysis = do_analyze_crash(Reason, Stacktrace),
     CrashInfo = #{
@@ -197,7 +200,8 @@ report_crash(Module, Reason, Stacktrace) ->
         reason => Reason,
         stacktrace => Stacktrace,
         analysis => Analysis,
-        timestamp => erlang:system_time(millisecond)
+        timestamp => erlang:system_time(millisecond),
+        session_id => maps:get(session_id, Opts, undefined)
     },
     CrashId = store_crash(crash, Reason, CrashInfo),
     io:format("[healer] Crash reported: ~p in ~p~n", [Reason, Module]),
@@ -417,14 +421,22 @@ generate_crash_report_content(CrashId, CrashData) ->
     Reason = maps:get(reason, CrashData, unknown),
     Stacktrace = maps:get(stacktrace, CrashData, []),
     Analysis = maps:get(analysis, CrashData, #{}),
+    SessionId = maps:get(session_id, CrashData, undefined),
     
     SuggestedFix = maps:get(suggested_fix, Analysis, #{}),
     AffectedModules = maps:get(affected_modules, Analysis, []),
+    
+    SessionSection = case SessionId of
+        undefined -> <<"">>;
+        <<"">> -> <<"">>;
+        Sid -> io_lib:format("**Session ID:** ~s\n\n", [Sid])
+    end,
     
     iolist_to_binary([
         <<"# Crash Report\n\n">>,
         io_lib:format("**Crash ID:** ~s\n\n", [CrashId]),
         io_lib:format("**Timestamp:** ~s (UTC)\n\n", [DateTimeStr]),
+        SessionSection,
         io_lib:format("**Module:** ~p\n\n", [Module]),
         io_lib:format("**Error Type:** ~p\n\n", [ErrorType]),
         io_lib:format("**Error:**\n\n```\n~p\n```\n\n", [Reason]),
