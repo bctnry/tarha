@@ -47,3 +47,9 @@ example-project/
 test/
 *.crashdumpsessions/*.json
 sessions/*.json
+
+# Crash dumps
+erl_crash.dump
+*.crashdump
+.coding_agent_crashes/
+.coding_agent_reports/
