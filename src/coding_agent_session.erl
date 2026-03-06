@@ -4,6 +4,7 @@
 -export([start_link/0, start_link/1, start_link/2, new/0, new/1, ask/2, ask/3]).
 -export([history/1, clear/1, stop_session/1, sessions/0]).
 -export([open_files/1, close_file/2, stats/1, ask_stream/3]).
+-export([save_session/1, load_session/1, list_saved_sessions/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -292,6 +293,8 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
             },
             % Check if consolidation needed (async)
             maybe_trigger_consolidation(),
+            % Auto-save session (async)
+            maybe_save_session(NewState),
             {reply, {ok, Response, Thinking, ReplyHistory}, NewState};
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -318,6 +321,37 @@ handle_call(stats, _From, State = #state{total_tokens = Tokens, tool_calls = Cal
 
 handle_call(clear, _From, State) ->
     {reply, ok, State#state{messages = [], open_files = #{}}};
+
+handle_call(save_session, _From, State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles}) ->
+    SessionData = #{
+        id => Id,
+        model => Model,
+        working_dir => list_to_binary(WD),
+        messages => State#state.messages,
+        open_files => OpenFiles,
+        total_tokens => State#state.total_tokens,
+        tool_calls => State#state.tool_calls
+    },
+    case coding_agent_session_store:save_session(Id, SessionData) of
+        ok -> {reply, {ok, Id}, State};
+        {error, Reason} -> {reply, {error, Reason}, State}
+    end;
+
+handle_call({restore_state, Data}, _From, _State) ->
+    NewState = #state{
+        id = maps:get(id, Data, <<>>),
+        model = maps:get(model, Data, <<"glm-5:cloud">>),
+        messages = maps:get(messages, Data, []),
+        working_dir = case maps:get(working_dir, Data, ".") of
+            W when is_binary(W) -> binary_to_list(W);
+            W when is_list(W) -> W;
+            _ -> "."
+        end,
+        open_files = maps:get(open_files, Data, #{}),
+        total_tokens = maps:get(total_tokens, Data, 0),
+        tool_calls = maps:get(tool_calls, Data, 0)
+    },
+    {reply, ok, NewState};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
@@ -561,3 +595,48 @@ strip_frontmatter(Content) when is_binary(Content) ->
         _ -> Content
     end;
 strip_frontmatter(Content) -> Content.
+
+%% Auto-save session (async)
+maybe_save_session(State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles}) ->
+    spawn(fun() ->
+        SessionData = #{
+            id => Id,
+            model => Model,
+            working_dir => list_to_binary(WD),
+            messages => State#state.messages,
+            open_files => OpenFiles,
+            total_tokens => State#state.total_tokens,
+            tool_calls => State#state.tool_calls
+        },
+        coding_agent_session_store:save_session(Id, SessionData)
+    end).
+
+%% Session persistence API
+
+save_session(SessionId) when is_binary(SessionId); is_list(SessionId) ->
+    SessionIdBin = if is_list(SessionId) -> list_to_binary(SessionId); true -> SessionId end,
+    case ets:lookup(?SESSIONS_TABLE, SessionIdBin) of
+        [{_, Pid}] -> gen_server:call(Pid, save_session);
+        [] -> {error, session_not_found}
+    end.
+
+load_session(SessionId) when is_binary(SessionId); is_list(SessionId) ->
+    SessionIdBin = if is_list(SessionId) -> list_to_binary(SessionId); true -> SessionId end,
+    case coding_agent_session_store:load_session(SessionIdBin) of
+        {ok, Data} ->
+            case coding_agent_session_sup:start_session(SessionIdBin) of
+                {ok, Pid} ->
+                    gen_server:call(Pid, {restore_state, Data}),
+                    ets:insert(?SESSIONS_TABLE, {SessionIdBin, Pid}),
+                    {ok, {SessionIdBin, Pid}};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, not_found} ->
+            {error, session_not_found};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+list_saved_sessions() ->
+    coding_agent_session_store:list_sessions().

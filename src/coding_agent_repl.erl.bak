@@ -68,7 +68,7 @@ loop(SessionId, History) ->
             Input = sanitize_input(Line),
             case Input of
                 "" -> 
-                    ?MODULE:loop(SessionId, History);
+                    loop(SessionId, History);
                 _ -> 
                     case process_input(SessionId, History, Input) of
                         {continue, NewHistory} ->
@@ -85,7 +85,7 @@ loop(SessionId, History) ->
                 _ -> coding_agent_healer:analyze_crash(Type, Stacktrace)
             end,
             io:format("Session preserved. Continuing...~n~n"),
-            ?MODULE:loop(SessionId, History)
+            loop(SessionId, History)
     end.
 
 sanitize_input(Line) ->

@@ -5,6 +5,12 @@
 -define(DEFAULT_PORT, 8080).
 -define(DEFAULT_HOST, "localhost").
 
+-define(CORS_HEADERS, #{
+    <<"access-control-allow-origin">> => <<"*">>,
+    <<"access-control-allow-methods">> => <<"GET, POST, OPTIONS">>,
+    <<"access-control-allow-headers">> => <<"Content-Type, Authorization">>
+}).
+
 start_link() ->
     start_link([]).
 
@@ -20,6 +26,9 @@ start_link(Options) ->
             {"/chat", ?MODULE, #{action => chat}},
             {"/session", ?MODULE, #{action => session}},
             {"/session/:id", ?MODULE, #{action => session_info}},
+            {"/session/:id/save", ?MODULE, #{action => session_save}},
+            {"/session/:id/load", ?MODULE, #{action => session_load}},
+            {"/sessions", ?MODULE, #{action => sessions_list}},
             {"/memory", ?MODULE, #{action => memory}},
             {"/memory/history", ?MODULE, #{action => memory_history}},
             {"/memory/consolidate", ?MODULE, #{action => memory_consolidate}},
@@ -41,17 +50,9 @@ start_link(Options) ->
 stop() ->
     cowboy:stop_listener(http).
 
--define(CORS_HEADERS, #{
-    <<"access-control-allow-origin">> => <<"*">>,
-    <<"access-control-allow-methods">> => <<"GET, POST, OPTIONS">>,
-    <<"access-control-allow-headers">> => <<"Content-Type, Authorization">>
-}).
-
 init(Req, State) ->
     Action = maps:get(action, State, index),
     Method = cowboy_req:method(Req),
-    Path = cowboy_req:path(Req),
-    io:format("[http] Request: ~s ~s (action=~p)~n", [Method, Path, Action]),
     
     case Method of
         <<"OPTIONS">> ->
@@ -77,10 +78,12 @@ init(Req, State) ->
             end
     end.
 
+%% API endpoints
+
 handle_action(<<"GET">>, index, _Req) ->
     {ok, #{
         name => <<"coding_agent">>,
-        version => <<"0.4.0">>,
+        version => <<"0.5.0">>,
         endpoints => [
             #{method => <<"GET">>, path => <<"/">>, description => <<"API info">>},
             #{method => <<"GET">>, path => <<"/health">>, description => <<"Health check">>},
@@ -88,6 +91,9 @@ handle_action(<<"GET">>, index, _Req) ->
             #{method => <<"POST">>, path => <<"/chat">>, description => <<"Send message to agent">>},
             #{method => <<"POST">>, path => <<"/session">>, description => <<"Create session">>},
             #{method => <<"GET">>, path => <<"/session/:id">>, description => <<"Get session info">>},
+            #{method => <<"POST">>, path => <<"/session/:id/save">>, description => <<"Save session to disk">>},
+            #{method => <<"POST">>, path => <<"/session/:id/load">>, description => <<"Load session from disk">>},
+            #{method => <<"GET">>, path => <<"/sessions">>, description => <<"List saved sessions">>},
             #{method => <<"GET">>, path => <<"/memory">>, description => <<"Get long-term memory">>},
             #{method => <<"POST">>, path => <<"/memory">>, description => <<"Update long-term memory">>},
             #{method => <<"GET">>, path => <<"/memory/history">>, description => <<"Get conversation history log">>},
@@ -126,7 +132,7 @@ handle_action(<<"POST">>, chat, Req) ->
     end;
 
 handle_action(<<"POST">>, session, Req) ->
-    {ok, Body, _Req2} = cowboy_req:read_body(Req),
+    {ok, Body, _} = cowboy_req:read_body(Req),
     case jsx:is_json(Body) of
         true ->
             Data = jsx:decode(Body, [return_maps]),
@@ -139,6 +145,28 @@ handle_action(<<"POST">>, session, Req) ->
 handle_action(<<"GET">>, session_info, Req) ->
     SessionId = cowboy_req:binding(id, Req),
     get_session_status(SessionId);
+
+handle_action(<<"POST">>, session_save, Req) ->
+    SessionId = cowboy_req:binding(id, Req),
+    case coding_agent_session:save_session(SessionId) of
+        {ok, Id} -> {ok, #{session_id => Id, status => saved}};
+        {error, session_not_found} -> {error, 404, session_not_found};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
+    end;
+
+handle_action(<<"POST">>, session_load, Req) ->
+    SessionId = cowboy_req:binding(id, Req),
+    case coding_agent_session:load_session(SessionId) of
+        {ok, {Id, _Pid}} -> {ok, #{session_id => Id, status => loaded}};
+        {error, session_not_found} -> {error, 404, session_not_found};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
+    end;
+
+handle_action(<<"GET">>, sessions_list, _Req) ->
+    case coding_agent_session:list_saved_sessions() of
+        {ok, SessionIds} -> {ok, #{sessions => SessionIds, count => length(SessionIds)}};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
+    end;
 
 handle_action(<<"GET">>, tools, _Req) ->
     Tools = coding_agent_tools:tools(),
@@ -214,6 +242,8 @@ handle_action(<<"GET">>, skill_detail, Req) ->
 handle_action(_, _, _Req) ->
     {error, 404, not_found}.
 
+%% Helper functions
+
 get_memory_status() ->
     case ets:info(coding_agent_sessions) of
         undefined -> #{status => not_running};
@@ -230,6 +260,13 @@ get_session_count() ->
                 N when is_integer(N) -> N;
                 _ -> 0
             end
+    end.
+
+get_session_status(SessionId) when is_binary(SessionId) ->
+    case coding_agent_session:stats(SessionId) of
+        {ok, Stats} -> {ok, Stats};
+        {error, not_found} -> {error, 404, session_not_found};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
     end.
 
 send_message(Message, undefined) ->
@@ -267,16 +304,6 @@ handle_session_action(<<"clear">>, Data) ->
     end;
 handle_session_action(_, _) ->
     {error, 400, unknown_action}.
-
-get_session_status(SessionId) when is_binary(SessionId) ->
-    case coding_agent_session:stats(SessionId) of
-        {ok, Stats} ->
-            {ok, Stats};
-        {error, not_found} ->
-            {error, 404, session_not_found};
-        {error, Reason} ->
-            {error, 500, io_lib:format("Error: ~p", [Reason])}
-    end.
 
 format_tool(Tool) ->
     #{

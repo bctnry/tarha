@@ -45,4 +45,4 @@ conv.md
 context.md
 example-project/
 test/
-*.crashdump
+*.crashdumpsessions/*.json
