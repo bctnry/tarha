@@ -411,6 +411,7 @@ write_crash_report(CrashId) ->
 
 generate_crash_report_content(CrashId, CrashData) ->
     Timestamp = maps:get(timestamp, CrashData, 0),
+    DateTimeStr = format_datetime_utc(Timestamp),
     ErrorType = maps:get(type, CrashData, unknown),
     Module = maps:get(module, CrashData, unknown),
     Reason = maps:get(reason, CrashData, unknown),
@@ -423,7 +424,7 @@ generate_crash_report_content(CrashId, CrashData) ->
     iolist_to_binary([
         <<"# Crash Report\n\n">>,
         io_lib:format("**Crash ID:** ~s\n\n", [CrashId]),
-        io_lib:format("**Timestamp:** ~p\n\n", [Timestamp]),
+        io_lib:format("**Timestamp:** ~s (UTC)\n\n", [DateTimeStr]),
         io_lib:format("**Module:** ~p\n\n", [Module]),
         io_lib:format("**Error Type:** ~p\n\n", [ErrorType]),
         io_lib:format("**Error:**\n\n```\n~p\n```\n\n", [Reason]),
@@ -442,6 +443,17 @@ generate_crash_report_content(CrashId, CrashData) ->
         <<"- [ ] Fixed\n">>,
         <<"- [ ] Verified\n">>
     ]).
+
+format_datetime_utc(TimestampMs) when is_integer(TimestampMs), TimestampMs > 0 ->
+    Seconds = TimestampMs div 1000,
+    {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:system_time_to_universal_time(Seconds, second),
+    iolib_to_binary(io_lib:format("~4..0w-~2..0w-~2..0w ~2..0w:~2..0w:~2..0w UTC", 
+        [Year, Month, Day, Hour, Min, Sec]));
+format_datetime_utc(_) ->
+    <<"unknown">>.
+
+iolib_to_binary(IoList) ->
+    iolist_to_binary(IoList).
 
 format_stacktrace_for_report(Stacktrace) when is_list(Stacktrace) ->
     format_stacktrace_list(Stacktrace);

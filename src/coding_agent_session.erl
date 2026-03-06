@@ -690,7 +690,9 @@ compact_session(State = #state{id = Id, messages = Messages, model = Model, tota
     end.
 
 archive_session(#state{id = Id, model = Model, messages = Messages, working_dir = WD, open_files = OpenFiles, total_tokens = Tokens, tool_calls = Calls}) ->
-    ArchiveId = <<Id/binary, "-archived-", (integer_to_binary(erlang:system_time(millisecond)))/binary>>,
+    Timestamp = erlang:system_time(millisecond),
+    DateTimeStr = format_datetime_utc(Timestamp),
+    ArchiveId = <<Id/binary, "-archived-", DateTimeStr/binary>>,
     filelib:ensure_dir(?ARCHIVE_DIR ++ "/"),
     ArchivePath = filename:join(?ARCHIVE_DIR, <<ArchiveId/binary, ".json">>),
     ArchiveData = #{
@@ -702,12 +704,21 @@ archive_session(#state{id = Id, model = Model, messages = Messages, working_dir 
         open_files => OpenFiles,
         total_tokens => Tokens,
         tool_calls => Calls,
-        archived_at => erlang:system_time(millisecond)
+        archived_at => Timestamp,
+        archived_at_utc => DateTimeStr
     },
     case file:write_file(ArchivePath, jsx:encode(ArchiveData)) of
         ok -> ArchiveId;
         _ -> <<>>
     end.
+
+format_datetime_utc(TimestampMs) when is_integer(TimestampMs) ->
+    Seconds = TimestampMs div 1000,
+    {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:system_time_to_universal_time(Seconds, second),
+    iolist_to_binary(io_lib:format("~4..0w-~2..0w-~2..0wT~2..0w:~2..0w:~2..0wZ", 
+        [Year, Month, Day, Hour, Min, Sec]));
+format_datetime_utc(_) ->
+    <<"unknown">>.
 
 summarize_messages([], _Model) ->
     {ok, <<"No previous conversation.">>};
