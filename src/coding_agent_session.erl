@@ -242,23 +242,37 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
     % Get skills context
     SkillsContext = get_skills_context(),
     
-    SystemContent = case {FileContext, MemoryContext, SkillsContext} of
-        {<<>>, <<>>, <<>>} -> 
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary>>;
-        {_, <<>>, <<>>} -> 
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\nOpen files (cached in context):\n", FileContext/binary>>;
-        {<<>>, _, <<>>} ->
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\n", MemoryContext/binary>>;
-        {<<>>, <<>>, _} ->
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\n# Skills\n\n", SkillsContext/binary>>;
-        {_, _, <<>>} ->
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\n", MemoryContext/binary, "\n\nOpen files (cached in context):\n", FileContext/binary>>;
-        {_, <<>>, _} ->
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\nOpen files (cached in context):\n", FileContext/binary, "\n\n# Skills\n\n", SkillsContext/binary>>;
-        {<<>>, _, _} ->
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\n", MemoryContext/binary, "\n\n# Skills\n\n", SkillsContext/binary>>;
-        {_, _, _} ->
-            <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary, "\n\n", MemoryContext/binary, "\n\nOpen files (cached in context):\n", FileContext/binary, "\n\n# Skills\n\n", SkillsContext/binary>>
+    % Get AGENTS.md context
+    AgentsContext = get_agents_context(),
+    
+    % Build system prompt with all context sections
+    ContextParts = [],
+    
+    % Base prompt
+    BasePrompt = <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary>>,
+    
+    % Add AGENTS.md if present
+    WithAgents = case AgentsContext of
+        <<>> -> BasePrompt;
+        _ -> <<BasePrompt/binary, "\n\n# Project Context (AGENTS.md)\n\n", AgentsContext/binary>>
+    end,
+    
+    % Add memory if present
+    WithMemory = case MemoryContext of
+        <<>> -> WithAgents;
+        _ -> <<WithAgents/binary, "\n\n", MemoryContext/binary>>
+    end,
+    
+    % Add skills if present
+    WithSkills = case SkillsContext of
+        <<>> -> WithMemory;
+        _ -> <<WithMemory/binary, "\n\n# Skills\n\n", SkillsContext/binary>>
+    end,
+    
+    % Add open files if present
+    SystemContent = case FileContext of
+        <<>> -> WithSkills;
+        _ -> <<WithSkills/binary, "\n\nOpen files (cached in context):\n", FileContext/binary>>
     end,
     
     SystemMsg = #{<<"role">> => <<"system">>, <<"content">> => SystemContent},
@@ -520,3 +534,30 @@ get_skills_context() ->
                 _ -> <<>>
             end
     end.
+
+get_agents_context() ->
+    Workspace = get_workspace(),
+    AgentsFile = filename:join(Workspace, "AGENTS.md"),
+    case file:read_file(AgentsFile) of
+        {ok, Content} ->
+            % Strip frontmatter if present
+            strip_frontmatter(Content);
+        _ -> <<>>
+    end.
+
+get_workspace() ->
+    case file:get_cwd() of
+        {ok, Dir} -> Dir;
+        _ -> "."
+    end.
+
+strip_frontmatter(Content) when is_binary(Content) ->
+    case binary:match(Content, <<"---">>) of
+        {0, _} ->
+            case binary:split(Content, <<"---">>, [global]) of
+                [_, _, Rest | _] -> binary:strip(Rest);
+                _ -> Content
+            end;
+        _ -> Content
+    end;
+strip_frontmatter(Content) -> Content.
