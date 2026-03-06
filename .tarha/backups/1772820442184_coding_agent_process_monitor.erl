@@ -12,14 +12,12 @@
 }).
 
 -define(MEMORY_TABLE, coding_agent_process_monitor).
--define(CRASH_DIR, ".tarha/crashes").
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
     ets:new(?MEMORY_TABLE, [named_table, public, set]),
-    filelib:ensure_dir(?CRASH_DIR ++ "/"),
     schedule_gc_check(),
     {ok, #state{}}.
 
@@ -378,43 +376,7 @@ store_crash_info(Pid, Reason) ->
         reason => Reason,
         timestamp => erlang:system_time(millisecond)
     },
-    ets:insert(?MEMORY_TABLE, {CrashId, CrashInfo}),
-    % Also save crash report to disk
-    spawn(fun() -> write_crash_report_to_disk(CrashId, CrashInfo) end),
-    CrashId.
-
-write_crash_report_to_disk(CrashId, CrashInfo) ->
-    filelib:ensure_dir(?CRASH_DIR ++ "/"),
-    
-    ReportContent = generate_process_crash_report(CrashId, CrashInfo),
-    Filename = filename:join(?CRASH_DIR, binary_to_list(CrashId) ++ ".md"),
-    
-    case file:write_file(Filename, ReportContent) of
-        ok -> 
-            io:format("[memory] Crash report saved to ~s~n", [Filename]);
-        {error, Err} ->
-            io:format("[memory] Failed to write crash report: ~p~n", [Err])
-    end.
-
-generate_process_crash_report(CrashId, CrashInfo) ->
-    Timestamp = maps:get(timestamp, CrashInfo, 0),
-    Pid = maps:get(pid, CrashInfo, unknown),
-    Reason = maps:get(reason, CrashInfo, unknown),
-    
-    iolist_to_binary([
-        <<"# Process Crash Report\n\n">>,
-        io_lib:format("**Crash ID:** ~s\n\n", [CrashId]),
-        io_lib:format("**Timestamp:** ~p\n\n", [Timestamp]),
-        io_lib:format("**Process:** ~p\n\n", [Pid]),
-        <<"## Reason\n\n">>,
-        <<"```\n">>,
-        io_lib:format("~p", [Reason]),
-        <<"\n```\n\n">>,
-        <<"## Status\n\n">>,
-        <<"- [ ] Investigated\n">>,
-        <<"- [ ] Fixed\n">>,
-        <<"- [ ] Verified\n">>
-    ]).
+    ets:insert(?MEMORY_TABLE, {CrashId, CrashInfo}).
 
 generate_crash_id() ->
     <<A:32, B:32>> = crypto:strong_rand_bytes(8),

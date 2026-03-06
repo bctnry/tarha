@@ -385,6 +385,9 @@ store_crash_info(Pid, Reason) ->
 
 write_crash_report_to_disk(CrashId, CrashInfo) ->
     filelib:ensure_dir(?CRASH_DIR ++ "/"),
+    Timestamp = maps:get(timestamp, CrashInfo, erlang:system_time(millisecond)),
+    Pid = maps:get(pid, CrashInfo, unknown),
+    Reason = maps:get(reason, CrashInfo, unknown),
     
     ReportContent = generate_process_crash_report(CrashId, CrashInfo),
     Filename = filename:join(?CRASH_DIR, binary_to_list(CrashId) ++ ".md"),

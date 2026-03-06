@@ -9,7 +9,7 @@
     messages :: list()
 }).
 
--define(MAX_ITERATIONS, 10).
+-define(MAX_ITERATIONS, 50).
 -define(SYSTEM_PROMPT, <<"You are a coding assistant with access to tools. Use the tools to help the user.
 Think carefully before acting. Plan your approach, then execute.
 When you have completed the task, respond with your final answer.

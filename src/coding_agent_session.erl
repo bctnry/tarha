@@ -17,9 +17,9 @@
     tool_calls :: integer()
 }).
 
--define(MAX_ITERATIONS, 15).
--define(MAX_HISTORY, 50).
--define(MAX_TOKENS, 80000).
+-define(MAX_ITERATIONS, 100).
+-define(MAX_HISTORY, 100).
+-define(MAX_TOKENS, 120000).
 -define(MAX_TOOL_RETRIES, 3).
 -define(SESSIONS_TABLE, coding_agent_sessions).
 -define(SYSTEM_PROMPT, <<"You are an autonomous coding assistant. You CAN and SHOULD take multiple actions to complete tasks without asking for permission between steps.
