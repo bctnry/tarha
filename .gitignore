@@ -53,3 +53,9 @@ erl_crash.dump
 *.crashdump
 .coding_agent_crashes/
 .coding_agent_reports/
+
+# Generated files
+.tarha/backups/
+.tarha/reports/
+.tarha/sessions/*.json
+dump.txt
