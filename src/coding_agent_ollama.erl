@@ -2,6 +2,7 @@
 -export([generate/2, generate_stream/2, chat/2, chat_with_tools/3, chat_stream/3, chat_stream/4]).
 -export([count_tokens/1, count_tokens_accurate/2, truncate_messages/2]).
 -export([start_token_cache/0, clear_token_cache/0]).
+-export([get_model_info/1, get_model_context_length/1, get_model_context_length/2]).
 
 -define(MAX_RETRIES, 20).
 -define(RETRY_DELAY_BASE, 1000).  % 1 second base, exponential backoff.
@@ -447,3 +448,53 @@ truncate_messages([Msg | Rest], MaxTokens, Acc) ->
         false ->
             truncate_messages(Rest, MaxTokens, [Msg | Acc])
     end.
+
+%% Model info functions - get context length from Ollama API
+
+-define(DEFAULT_CONTEXT_LENGTH, 8192).
+
+get_model_context_length(Model) ->
+    get_model_context_length(Model, ?DEFAULT_CONTEXT_LENGTH).
+
+get_model_context_length(Model, Default) when is_binary(Model) ->
+    case get_model_info(Model) of
+        {ok, #{<<"parameters">> := Params}} when is_map(Params) ->
+            case extract_context_length(Params) of
+                undefined -> Default;
+                Len when is_integer(Len), Len > 0 -> Len;
+                _ -> Default
+            end;
+        _ ->
+            Default
+    end;
+get_model_context_length(Model, Default) when is_list(Model) ->
+    get_model_context_length(list_to_binary(Model), Default).
+
+extract_context_length(Params) when is_map(Params) ->
+    Keys = [<<"context_length">>, <<"num_ctx">>, <<"n_ctx">>],
+    lists:foldl(fun(Key, Acc) ->
+        case Acc of
+            undefined -> maps:get(Key, Params, undefined);
+            _ -> Acc
+        end
+    end, undefined, Keys).
+
+get_model_info(Model) when is_binary(Model) ->
+    Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
+    Url = Host ++ "/api/show",
+    Body = jsx:encode(#{name => Model}),
+    Headers = [{<<"Content-Type">>, <<"application/json">>}],
+    case hackney:post(Url, Headers, Body, [{recv_timeout, 10000}, with_body]) of
+        {ok, 200, _RespHeaders, RespBody} ->
+            try jsx:decode(RespBody, [return_maps]) of
+                Resp -> {ok, Resp}
+            catch
+                _:_ -> {error, parse_error}
+            end;
+        {ok, StatusCode, _RespHeaders, RespBody} ->
+            {error, {http_error, StatusCode, RespBody}};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+get_model_info(Model) when is_list(Model) ->
+    get_model_info(list_to_binary(Model)).

@@ -176,9 +176,29 @@ process_command(SessionId, History, "status" ++ Rest) when Rest =:= []; hd(Rest)
     io:format("~nSession Status:~n"),
     try coding_agent_session:stats(SessionId) of
         {ok, Stats} ->
-            io:format("  Total tokens (est): ~p~n", [maps:get(<<"total_tokens_estimate">>, Stats, 0)]),
-            io:format("  Tool calls: ~p~n", [maps:get(<<"tool_calls">>, Stats, 0)]),
-            io:format("  Message count: ~p~n", [maps:get(<<"message_count">>, Stats, 0)]);
+            %% Session token stats
+            SessionPrompt = maps:get(<<"session_prompt_tokens">>, Stats, 0),
+            SessionCompletion = maps:get(<<"session_completion_tokens">>, Stats, 0),
+            SessionEstimated = maps:get(<<"session_estimated_tokens">>, Stats, 0),
+            SessionTotal = maps:get(<<"session_total_tokens">>, Stats, 0),
+            ToolCalls = maps:get(<<"tool_calls">>, Stats, 0),
+            MsgCount = maps:get(<<"message_count">>, Stats, 0),
+            io:format("  Session Tokens:~n"),
+            io:format("    Prompt:       ~p~n", [SessionPrompt]),
+            io:format("    Completion:   ~p~n", [SessionCompletion]),
+            io:format("    Estimated:    ~p~n", [SessionEstimated]),
+            io:format("    Total:        ~p~n", [SessionTotal]),
+            io:format("  Tool calls:    ~p~n", [ToolCalls]),
+            io:format("  Messages:      ~p~n", [MsgCount]),
+            
+            %% Global token stats from Ollama client
+            GlobalPrompt = maps:get(<<"global_prompt_tokens">>, Stats, 0),
+            GlobalCompletion = maps:get(<<"global_completion_tokens">>, Stats, 0),
+            GlobalEstimated = maps:get(<<"global_estimated_tokens">>, Stats, 0),
+            io:format("~nGlobal Token Stats:~n"),
+            io:format("    Total Prompt:     ~p~n", [GlobalPrompt]),
+            io:format("    Total Completion: ~p~n", [GlobalCompletion]),
+            io:format("    Total Estimated:  ~p~n", [GlobalEstimated]);
         {error, _} ->
             io:format("  (session error)~n")
     catch _:_ ->
@@ -489,17 +509,19 @@ process_command(SessionId, History, Unknown) ->
     {continue, History}.
 
 process_message(SessionId, History, Input) ->
+    process_message(SessionId, History, Input, 0).
+
+process_message(SessionId, History, Input, RetryCount) when RetryCount >= 3 ->
+    io:format("~nMax retries exceeded. Please try again.~n"),
+    {continue, History};
+process_message(SessionId, History, Input, RetryCount) ->
     Message = list_to_binary(Input),
     NewHistory = [Input | History],
     
     io:format("~nThinking...~n"),
     try coding_agent_session:ask(SessionId, Message) of
-        {ok, Response, Thinking, _History} ->
-            case Thinking of
-                <<>> -> ok;
-                _ -> 
-                    io:format("~n--- Thinking ---~n~s~n", [Thinking])
-            end,
+        {ok, Response, _Thinking, _History} ->
+            %% Thinking is already displayed by the session module before tool calls
             io:format("~n--- Response ---~n"),
             print_response(Response),
             io:format("~n"),
@@ -508,13 +530,17 @@ process_message(SessionId, History, Input) ->
             io:format("~nSession expired. Creating new session...~n"),
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
-            % Retry with new session
-            process_message(NewSessionId, NewHistory, Input);
+            % Retry with new session (reset retry count)
+            process_message(NewSessionId, NewHistory, Input, 0);
         {error, Reason} ->
             io:format("Error: ~p~n~n", [Reason]),
             report_error(Reason, SessionId),
             {continue, NewHistory}
     catch
+        exit:{timeout, _} ->
+            io:format("~nRequest timed out. Retrying (~p/3)...~n", [RetryCount + 1]),
+            timer:sleep(1000 * (RetryCount + 1)),
+            process_message(SessionId, History, Input, RetryCount + 1);
         Type:Error:Stacktrace ->
             io:format("~n⚠ Session crashed: ~p:~p~n", [Type, Error]),
             report_crash(Type, Error, Stacktrace, SessionId),

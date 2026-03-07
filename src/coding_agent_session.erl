@@ -10,17 +10,21 @@
 -record(state, {
     id :: binary(),
     model :: binary(),
+    context_length :: integer(),      % Model's max context window (from Ollama API)
     messages :: list(),
     working_dir :: string(),
     open_files :: #{binary() => binary()},  % Path => Content cache
-    total_tokens :: integer(),
+    prompt_tokens :: integer(),      % Actual tokens from API
+    completion_tokens :: integer(),  % Actual tokens from API  
+    estimated_tokens :: integer(),    % Estimated when API doesn't provide counts
     tool_calls :: integer()
 }).
 
 -define(MAX_ITERATIONS, 100).
 -define(MAX_HISTORY, 100).
--define(MAX_TOKENS, 80000).  % Compaction threshold - when exceeded, summarize context
--define(COMPACTION_THRESHOLD, 300000).  % Trigger compaction when tokens exceed this
+-define(DEFAULT_CONTEXT_LENGTH, 8192).  % Default if model info unavailable
+-define(CONTEXT_USAGE_THRESHOLD, 0.75).  % Compact when 75% of context used
+-define(COMPACTION_THRESHOLD, 300000).  % Legacy threshold (fallback)
 -define(ARCHIVE_DIR, ".tarha/sessions").
 -define(MAX_TOOL_RETRIES, 3).
 -define(SESSIONS_TABLE, coding_agent_sessions).
@@ -231,14 +235,23 @@ init([Id, WorkingDir]) ->
         <<>> -> generate_id();
         _ -> IdBin
     end,
+    %% Get model's context length from Ollama API
+    ContextLength = case coding_agent_ollama:get_model_context_length(Model) of
+        Len when is_integer(Len), Len > 0 -> Len;
+        _ -> ?DEFAULT_CONTEXT_LENGTH
+    end,
+    io:format("[session] Model ~s has context length ~p~n", [Model, ContextLength]),
     process_flag(trap_exit, true),
     {ok, #state{
         id = Id2,
         model = Model,
+        context_length = ContextLength,
         messages = [],
         working_dir = WD,
         open_files = #{},
-        total_tokens = 0,
+        prompt_tokens = 0,
+        completion_tokens = 0,
+        estimated_tokens = 0,
         tool_calls = 0
     }}.
 
@@ -294,13 +307,21 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
     Messages = [SystemMsg | ExistingHistory] ++ [UserMsg],
     
     case run_agent_loop(Model, Messages, 0, OpenFiles) of
-        {ok, Response, Thinking, NewHistory, FinalOpenFiles, TokensUsed} ->
+        {ok, Response, Thinking, NewHistory, FinalOpenFiles, TokenInfo} ->
             FinalHistory = trim_history(NewHistory, ?MAX_HISTORY),
             ReplyHistory = [{maps:get(<<"role">>, M), maps:get(<<"content">>, M, <<"">>)} || M <- lists:sublist(FinalHistory, 2, length(FinalHistory))],
+            
+            %% Extract token counts
+            PromptUsed = maps:get(prompt_tokens, TokenInfo, 0),
+            CompletionUsed = maps:get(completion_tokens, TokenInfo, 0),
+            EstimatedUsed = maps:get(estimated_tokens, TokenInfo, 0),
+            
             NewState = State#state{
                 messages = FinalHistory,
                 open_files = FinalOpenFiles,
-                total_tokens = State#state.total_tokens + TokensUsed,
+                prompt_tokens = State#state.prompt_tokens + PromptUsed,
+                completion_tokens = State#state.completion_tokens + CompletionUsed,
+                estimated_tokens = State#state.estimated_tokens + EstimatedUsed,
                 tool_calls = State#state.tool_calls + 1
             },
             % Check if consolidation needed (async)
@@ -326,18 +347,36 @@ handle_call({close_file, Path}, _From, State = #state{open_files = OpenFiles}) -
     NewOpenFiles = maps:remove(PathBin, OpenFiles),
     {reply, ok, State#state{open_files = NewOpenFiles}};
 
-handle_call(stats, _From, State = #state{total_tokens = Tokens, tool_calls = Calls}) ->
+handle_call(stats, _From, State = #state{prompt_tokens = PromptTokens, completion_tokens = CompletionTokens, estimated_tokens = EstimatedTokens, tool_calls = Calls, context_length = ContextLength, model = Model}) ->
+    %% Get global token stats from Ollama client
+    GlobalStats = coding_agent_ollama:get_token_stats(),
+    SessionTotal = PromptTokens + CompletionTokens + EstimatedTokens,
+    %% Calculate context usage percentage
+    UsagePercent = case ContextLength > 0 of
+        true -> (SessionTotal / ContextLength) * 100;
+        false -> 0.0
+    end,
     {reply, {ok, #{
-        <<"total_tokens_estimate">> => Tokens,
+        <<"session_prompt_tokens">> => PromptTokens,
+        <<"session_completion_tokens">> => CompletionTokens,
+        <<"session_estimated_tokens">> => EstimatedTokens,
+        <<"session_total_tokens">> => SessionTotal,
+        <<"context_length">> => ContextLength,
+        <<"context_usage_percent">> => round(UsagePercent * 10) / 10,  % 1 decimal
         <<"tool_calls">> => Calls,
-        <<"message_count">> => length(State#state.messages)
+        <<"message_count">> => length(State#state.messages),
+        <<"model">> => Model,
+        <<"global_prompt_tokens">> => maps:get(prompt_tokens, GlobalStats, 0),
+        <<"global_completion_tokens">> => maps:get(completion_tokens, GlobalStats, 0),
+        <<"global_estimated_tokens">> => maps:get(estimated_tokens, GlobalStats, 0)
     }}, State};
 
 handle_call(clear, _From, State) ->
     {reply, ok, State#state{messages = [], open_files = #{}}};
 
-handle_call(compact, _From, State = #state{id = Id, messages = Messages, model = Model, total_tokens = Tokens}) ->
-    io:format("[session] Compacting session ~s (~p tokens)~n", [Id, Tokens]),
+handle_call(compact, _From, State = #state{id = Id, messages = Messages, model = Model, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET}) ->
+    TotalTokens = PT + CT + ET,
+    io:format("[session] Compacting session ~s (~p tokens)~n", [Id, TotalTokens]),
     ArchiveId = archive_session(State),
     case summarize_messages(Messages, Model) of
         {ok, SummaryText} ->
@@ -347,7 +386,9 @@ handle_call(compact, _From, State = #state{id = Id, messages = Messages, model =
             },
             NewState = State#state{
                 messages = [SummaryMsg],
-                total_tokens = byte_size(SummaryText) div 4
+                prompt_tokens = 0,
+                completion_tokens = 0,
+                estimated_tokens = byte_size(SummaryText) div 4
             },
             io:format("[session] Session compacted. Archived as ~s~n", [ArchiveId]),
             {reply, {ok, #{archived_as => ArchiveId, summary_size => byte_size(SummaryText)}}, NewState};
@@ -356,15 +397,19 @@ handle_call(compact, _From, State = #state{id = Id, messages = Messages, model =
             {reply, {error, Reason}, State}
     end;
 
-handle_call(save_session, _From, State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles}) ->
+handle_call(save_session, _From, State = #state{id = Id, model = Model, context_length = ContextLength, working_dir = WD, open_files = OpenFiles, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, tool_calls = TC}) ->
     SessionData = #{
         id => Id,
         model => Model,
+        context_length => ContextLength,
         working_dir => list_to_binary(WD),
         messages => State#state.messages,
         open_files => OpenFiles,
-        total_tokens => State#state.total_tokens,
-        tool_calls => State#state.tool_calls
+        prompt_tokens => PT,
+        completion_tokens => CT,
+        estimated_tokens => ET,
+        total_tokens => PT + CT + ET,
+        tool_calls => TC
     },
     case coding_agent_session_store:save_session(Id, SessionData) of
         ok -> {reply, {ok, Id}, State};
@@ -372,9 +417,21 @@ handle_call(save_session, _From, State = #state{id = Id, model = Model, working_
     end;
 
 handle_call({restore_state, Data}, _From, _State) ->
+    Model = maps:get(model, Data, <<"glm-5:cloud">>),
+    %% Get model's context length from Ollama API
+    ContextLength = case maps:get(context_length, Data, undefined) of
+        undefined ->
+            case coding_agent_ollama:get_model_context_length(Model) of
+                Len when is_integer(Len), Len > 0 -> Len;
+                _ -> ?DEFAULT_CONTEXT_LENGTH
+            end;
+        Len when is_integer(Len), Len > 0 -> Len;
+        _ -> ?DEFAULT_CONTEXT_LENGTH
+    end,
     NewState = #state{
         id = maps:get(id, Data, <<>>),
-        model = maps:get(model, Data, <<"glm-5:cloud">>),
+        model = Model,
+        context_length = ContextLength,
         messages = maps:get(messages, Data, []),
         working_dir = case maps:get(working_dir, Data, ".") of
             W when is_binary(W) -> binary_to_list(W);
@@ -382,7 +439,9 @@ handle_call({restore_state, Data}, _From, _State) ->
             _ -> "."
         end,
         open_files = maps:get(open_files, Data, #{}),
-        total_tokens = maps:get(total_tokens, Data, 0),
+        prompt_tokens = maps:get(prompt_tokens, Data, maps:get(total_tokens, Data, 0)),
+        completion_tokens = maps:get(completion_tokens, Data, 0),
+        estimated_tokens = maps:get(estimated_tokens, Data, 0),
         tool_calls = maps:get(tool_calls, Data, 0)
     },
     {reply, ok, NewState};
@@ -425,17 +484,28 @@ run_agent_loop(Model, Messages, Iteration, OpenFiles) ->
             TokenInfo = maps:get(token_info, Response, #{}),
             PromptTokens = maps:get(prompt_tokens, TokenInfo, undefined),
             CompletionTokens = maps:get(completion_tokens, TokenInfo, undefined),
-            ActualTokens = case {PromptTokens, CompletionTokens} of
-                {P, C} when is_integer(P), is_integer(C) -> P + C;
-                _ -> coding_agent_ollama:count_tokens(Messages)  % Fallback to estimate
+            IsEstimated = maps:get(is_estimated, TokenInfo, true),
+            
+            %% Build token tracking info
+            TokenInfoMap = case {PromptTokens, CompletionTokens, IsEstimated} of
+                {P, C, false} when is_integer(P), is_integer(C) ->
+                    #{prompt_tokens => P, completion_tokens => C, estimated_tokens => 0};
+                {P, C, true} when is_integer(P), is_integer(C) ->
+                    #{prompt_tokens => P, completion_tokens => C, estimated_tokens => 0};
+                _ ->
+                    %% Fallback to estimate
+                    EstTokens = coding_agent_ollama:count_tokens(Messages),
+                    #{prompt_tokens => 0, completion_tokens => 0, estimated_tokens => EstTokens}
             end,
-            handle_response(Model, Messages, ResponseMsg, Iteration, OpenFiles, ActualTokens);
+            handle_response(Model, Messages, ResponseMsg, Iteration, OpenFiles, TokenInfoMap);
         {error, Reason} ->
             {error, Reason}
     end.
 
-handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles, TokensUsed) ->
+handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles, TokenInfo) ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
+    %% Display thinking before executing tool calls
+    display_thinking(Thinking),
     AssistantMsg = #{
         <<"role">> => <<"assistant">>,
         <<"content">> => maps:get(<<"content">>, ResponseMsg, <<>>),
@@ -448,25 +518,34 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
     
     %% Estimate tokens for tool results (not included in API response)
     ToolResultTokens = coding_agent_ollama:count_tokens(ToolResults),
+    UpdatedTokenInfo = TokenInfo#{
+        estimated_tokens => maps:get(estimated_tokens, TokenInfo, 0) + ToolResultTokens
+    },
     
     case run_agent_loop(Model, MessagesWithResults, Iteration + 1, NewOpenFiles) of
-        {ok, Response, NewThinking, NewHistory, FinalOpenFiles, MoreTokens} ->
+        {ok, Response, NewThinking, NewHistory, FinalOpenFiles, MoreTokenInfo} ->
             CombinedThinking = case Thinking of
                 <<>> -> NewThinking;
                 _ -> <<Thinking/binary, "\n\n", NewThinking/binary>>
             end,
-            {ok, Response, CombinedThinking, NewHistory, FinalOpenFiles, TokensUsed + MoreTokens + ToolResultTokens};
+            %% Merge token info
+            MergedTokenInfo = #{
+                prompt_tokens => maps:get(prompt_tokens, TokenInfo, 0) + maps:get(prompt_tokens, MoreTokenInfo, 0),
+                completion_tokens => maps:get(completion_tokens, TokenInfo, 0) + maps:get(completion_tokens, MoreTokenInfo, 0),
+                estimated_tokens => maps:get(estimated_tokens, UpdatedTokenInfo, 0) + maps:get(estimated_tokens, MoreTokenInfo, 0)
+            },
+            {ok, Response, CombinedThinking, NewHistory, FinalOpenFiles, MergedTokenInfo};
         {error, Reason} ->
             {error, Reason}
     end;
 
-handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles, TokensUsed) when Content =/= <<>>, Content =/= nil ->
+handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles, TokenInfo) when Content =/= <<>>, Content =/= nil ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     AssistantMsg = #{<<"role">> => <<"assistant">>, <<"content">> => Content},
     NewHistory = Messages ++ [AssistantMsg],
-    {ok, Content, Thinking, NewHistory, OpenFiles, TokensUsed};
+    {ok, Content, Thinking, NewHistory, OpenFiles, TokenInfo};
 
-handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles, _TokensUsed) ->
+handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles, _TokenInfo) ->
     {error, unexpected_response}.
 
 execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
@@ -601,9 +680,9 @@ generate_id() ->
     iolist_to_binary(io_lib:format("~8.16.0b-~8.16.0b-~8.16.0b", [A, B, C])).
 
 trim_history(History) ->
-    trim_history(History, ?MAX_TOKENS).
+    trim_history(History, ?DEFAULT_CONTEXT_LENGTH).
 
-trim_history(History, MaxTokens) ->
+trim_history(History, MaxTokens) when is_integer(MaxTokens) ->
     HistorySize = coding_agent_ollama:count_tokens(History),
     case HistorySize > MaxTokens of
         false -> History;
@@ -625,6 +704,12 @@ trim_history(History, MaxTokens) ->
                     end
             end
     end.
+
+%% Display thinking content before tool execution
+display_thinking(<<>>) -> ok;
+display_thinking(Thinking) when is_binary(Thinking) ->
+    io:format("~n--- Thinking ---~n~s~n", [Thinking]);
+display_thinking(_) -> ok.
 
 get_memory_context() ->
     case whereis(coding_agent_conv_memory) of
@@ -689,13 +774,27 @@ strip_frontmatter(Content) when is_binary(Content) ->
 strip_frontmatter(Content) -> Content.
 
 %% Session compaction - summarize and archive old context
-maybe_compact_session(State = #state{total_tokens = Tokens}) when Tokens > ?COMPACTION_THRESHOLD ->
-    compact_session(State);
-maybe_compact_session(State) ->
-    State.
+%% Uses model's context_length from Ollama API for smarter compaction
+maybe_compact_session(State = #state{prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, context_length = ContextLength}) ->
+    TotalTokens = PT + CT + ET,
+    %% Calculate threshold based on context length
+    Threshold = case ContextLength > 0 of
+        true -> round(ContextLength * ?CONTEXT_USAGE_THRESHOLD);
+        false -> ?COMPACTION_THRESHOLD  % Fallback
+    end,
+    case TotalTokens > Threshold of
+        true -> 
+            io:format("[session] Context ~p/~p tokens (~p%), triggering compaction~n", 
+                      [TotalTokens, ContextLength, round((TotalTokens / ContextLength) * 100)]),
+            compact_session(State);
+        false -> 
+            State
+    end.
 
-compact_session(State = #state{id = Id, messages = Messages, model = Model, total_tokens = Tokens}) ->
-    io:format("[session] Compacting session ~s (~p tokens)~n", [Id, Tokens]),
+compact_session(State = #state{id = Id, messages = Messages, model = Model, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, context_length = ContextLength}) ->
+    TotalTokens = PT + CT + ET,
+    io:format("[session] Compacting session ~s (~p/~p tokens, ~p%)~n", 
+              [Id, TotalTokens, ContextLength, round((TotalTokens / ContextLength) * 100)]),
     
     % Archive old session
     ArchiveId = archive_session(State),
@@ -713,14 +812,17 @@ compact_session(State = #state{id = Id, messages = Messages, model = Model, tota
             io:format("[session] Session compacted. Archived as ~s~n", [ArchiveId]),
             State#state{
                 messages = [SummaryMsg],
-                total_tokens = byte_size(SummaryText) div 4  % Rough estimate
+                prompt_tokens = 0,
+                completion_tokens = 0,
+                estimated_tokens = byte_size(SummaryText) div 4  % Rough estimate
             };
         {error, _} ->
             io:format("[session] Compaction failed, keeping full context~n"),
             State
     end.
 
-archive_session(#state{id = Id, model = Model, messages = Messages, working_dir = WD, open_files = OpenFiles, total_tokens = Tokens, tool_calls = Calls}) ->
+archive_session(#state{id = Id, model = Model, context_length = ContextLength, messages = Messages, working_dir = WD, open_files = OpenFiles, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, tool_calls = Calls}) ->
+    TotalTokens = PT + CT + ET,
     Timestamp = erlang:system_time(millisecond),
     DateTimeStr = format_datetime_utc(Timestamp),
     ArchiveId = <<Id/binary, "-archived-", DateTimeStr/binary>>,
@@ -730,11 +832,19 @@ archive_session(#state{id = Id, model = Model, messages = Messages, working_dir 
         id => ArchiveId,
         original_id => Id,
         model => Model,
+        context_length => ContextLength,
         working_dir => list_to_binary(WD),
         messages => Messages,
         open_files => OpenFiles,
-        total_tokens => Tokens,
+        total_tokens => TotalTokens,
+        prompt_tokens => PT,
+        completion_tokens => CT,
+        estimated_tokens => ET,
         tool_calls => Calls,
+        context_usage_percent => case ContextLength > 0 of
+            true -> round((TotalTokens / ContextLength) * 100 * 10) / 10;
+            false -> 0.0
+        end,
         archived_at => Timestamp,
         archived_at_utc => DateTimeStr
     },
@@ -798,16 +908,19 @@ messages_to_text(Messages) ->
     end, <<"">>, Messages).
 
 %% Auto-save session (async)
-maybe_save_session(State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles}) ->
+maybe_save_session(State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, tool_calls = TC, messages = Messages}) ->
     spawn(fun() ->
         SessionData = #{
             id => Id,
             model => Model,
             working_dir => list_to_binary(WD),
-            messages => State#state.messages,
+            messages => Messages,
             open_files => OpenFiles,
-            total_tokens => State#state.total_tokens,
-            tool_calls => State#state.tool_calls
+            prompt_tokens => PT,
+            completion_tokens => CT,
+            estimated_tokens => ET,
+            total_tokens => PT + CT + ET,
+            tool_calls => TC
         },
         coding_agent_session_store:save_session(Id, SessionData)
     end).
