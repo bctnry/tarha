@@ -279,38 +279,61 @@ process_command(_SessionId, History, "model " ++ ModelName) ->
     io:format("~nModel Details for: ~s~n", [Name]),
     case coding_agent_ollama:show_model(Name, #{}) of
         {ok, ModelInfo} ->
-            Details = maps:get(<<"details">>, ModelInfo, #{}),
-            Family = maps:get(<<"family">>, Details, <<"unknown">>),
-            ParamSize = maps:get(<<"parameter_size">>, Details, <<"unknown">>),
-            QuantLevel = maps:get(<<"quantization_level">>, Details, <<"unknown">>),
-            Capabilities = maps:get(<<"capabilities">>, ModelInfo, []),
-            Parameters = maps:get(<<"parameters">>, ModelInfo, undefined),
-            License = maps:get(<<"license">>, ModelInfo, undefined),
-            Modified = maps:get(<<"modified_at">>, ModelInfo, undefined),
-            ModelInfoMap = maps:get(<<"model_info">>, ModelInfo, #{}),
+            % Print all top-level fields
+            print_model_field(ModelInfo, <<"name">>, "Name"),
+            print_model_field(ModelInfo, <<"remote_model">>, "Remote Model"),
+            print_model_field(ModelInfo, <<"remote_host">>, "Remote Host"),
+            print_model_field(ModelInfo, <<"modified_at">>, "Modified"),
+            print_model_field(ModelInfo, <<"license">>, "License"),
             
-            io:format("  Family: ~s~n", [Family]),
-            io:format("  Parameter Size: ~s~n", [ParamSize]),
-            io:format("  Quantization: ~s~n", [QuantLevel]),
-            io:format("  Modified: ~s~n", [Modified]),
-            case License of
-                undefined -> ok;
-                _ -> io:format("  License: ~s~n", [binary:part(License, 0, min(byte_size(License), 100))])
-            end,
+            % Print capabilities
+            Capabilities = maps:get(<<"capabilities">>, ModelInfo, []),
             case Capabilities of
                 [] -> ok;
                 _ -> io:format("  Capabilities: ~p~n", [Capabilities])
             end,
-            case Parameters of
-                undefined -> ok;
-                _ -> 
-                    ParamStr = binary:part(Parameters, 0, min(byte_size(Parameters), 200)),
-                    io:format("  Parameters: ~s~n", [ParamStr])
+            
+            % Print details
+            Details = maps:get(<<"details">>, ModelInfo, #{}),
+            case Details of
+                #{} when map_size(Details) > 0 ->
+                    io:format("~n  Details:~n"),
+                    print_map_indented(Details, "    ");
+                _ -> ok
             end,
             
-            % Try to extract context length
-            CtxLen = find_context_length(ModelInfoMap),
-            io:format("  Context Length: ~p~n", [CtxLen]),
+            % Print modelfile if present
+            Modelfile = maps:get(<<"modelfile">>, ModelInfo, undefined),
+            case Modelfile of
+                undefined -> ok;
+                MF when byte_size(MF) > 0 ->
+                    Lines = binary:split(MF, <<"\n">>, [global]),
+                    io:format("~n  Modelfile:~n"),
+                    lists:foreach(fun(L) -> io:format("    ~s~n", [L]) end, Lines);
+                _ -> ok
+            end,
+            
+            % Print model_info if present
+            ModelInfoMap = maps:get(<<"model_info">>, ModelInfo, #{}),
+            case ModelInfoMap of
+                #{} when map_size(ModelInfoMap) > 0 ->
+                    io:format("~n  Model Info:~n"),
+                    print_map_indented(ModelInfoMap, "    ");
+                _ -> ok
+            end,
+            
+            % Print parameters if present
+            Parameters = maps:get(<<"parameters">>, ModelInfo, undefined),
+            case Parameters of
+                undefined -> ok;
+                _ ->
+                    ParamStr = binary:part(Parameters, 0, min(byte_size(Parameters), 500)),
+                    io:format("~n  Parameters: ~s~n", [ParamStr])
+            end,
+            
+            % Context length from all possible locations
+            CtxLen = find_context_length(ModelInfo),
+            io:format("~n  Context Length: ~p~n", [CtxLen]),
             
             io:format("~n"),
             {continue, History};
@@ -589,6 +612,13 @@ process_command(SessionId, History, "dump" ++ Rest) when Rest =:= []; hd(Rest) =
 process_command(SessionId, History, Unknown) ->
     io:format("Unknown command: /~s~nType /help for available commands.~n~n", [Unknown]),
     {continue, History}.
+
+print_model_field(Map, Key, Label) ->
+    case maps:get(Key, Map, undefined) of
+        undefined -> ok;
+        Value when is_binary(Value) -> io:format("  ~s: ~s~n", [Label, Value]);
+        _ -> ok
+    end.
 
 process_message(SessionId, History, Input) ->
     process_message(SessionId, History, Input, 0).
@@ -1016,6 +1046,50 @@ find_first([Value | _]) ->
     Value;
 find_first([]) ->
     undefined.
+
+print_map_indented(Map, Indent) when is_map(Map) ->
+    SortedKeys = lists:sort(maps:keys(Map)),
+    lists:foreach(fun(Key) ->
+        Value = maps:get(Key, Map),
+        KeyStr = case is_binary(Key) of true -> binary_to_list(Key); false -> io_lib:format("~p", [Key]) end,
+        case Value of
+            NestedMap when is_map(NestedMap), map_size(NestedMap) > 0 ->
+                io:format("~s~s:~n", [Indent, KeyStr]),
+                print_map_indented(NestedMap, Indent ++ "  ");
+            NestedList when is_list(NestedList), length(NestedList) > 0, is_list(hd(NestedList)) ->
+                io:format("~s~s: [~n", [Indent, KeyStr]),
+                lists:foreach(fun(Item) ->
+                    case Item of
+                        ItemMap when is_map(ItemMap) ->
+                            io:format("~s  {~n", [Indent]),
+                            print_map_indented(ItemMap, Indent ++ "    "),
+                            io:format("~s  }~n", [Indent]);
+                        _ ->
+                            io:format("~s  ~p~n", [Indent, Item])
+                    end
+                end, NestedList),
+                io:format("~s]~n", [Indent]);
+            Bin when is_binary(Bin) ->
+                Str = binary_to_list(Bin),
+                io:format("~s~s: ~s~n", [Indent, KeyStr, Str]);
+            Int when is_integer(Int) ->
+                io:format("~s~s: ~p~n", [Indent, KeyStr, Int]);
+            Float when is_float(Float) ->
+                io:format("~s~s: ~p~n", [Indent, KeyStr, Float]);
+            true ->
+                io:format("~s~s: true~n", [Indent, KeyStr]);
+            false ->
+                io:format("~s~s: false~n", [Indent, KeyStr]);
+            null ->
+                io:format("~s~s: null~n", [Indent, KeyStr]);
+            undefined ->
+                io:format("~s~s: undefined~n", [Indent, KeyStr]);
+            Other ->
+                io:format("~s~s: ~p~n", [Indent, KeyStr, Other])
+        end
+    end, SortedKeys);
+print_map_indented(_, _) ->
+    ok.
 
 print_response(<<>>) ->
     ok;
