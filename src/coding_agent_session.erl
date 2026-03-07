@@ -23,8 +23,8 @@
 -define(MAX_ITERATIONS, 100).
 -define(MAX_HISTORY, 100).
 -define(DEFAULT_CONTEXT_LENGTH, 32768).  % Default if model info unavailable
--define(CONTEXT_USAGE_THRESHOLD, 0.75).  % Compact when 75% of context used
--define(COMPACTION_THRESHOLD, 300000).  % Legacy threshold (fallback)
+-define(CONTEXT_USAGE_THRESHOLD, 2.0).  % Effectively disabled (200%)
+-define(COMPACTION_THRESHOLD, 999999999).  % Effectively disabled
 -define(ARCHIVE_DIR, ".tarha/sessions").
 -define(MAX_TOOL_RETRIES, 3).
 -define(SESSIONS_TABLE, coding_agent_sessions).
