@@ -1085,8 +1085,8 @@ run_git_command(Cmd) ->
     case os:cmd(Cmd ++ " 2>&1") of
         [] -> #{<<"success">> => true, <<"output">> => <<"">>};
         Result ->
-            Trimmed = string:trim(Result, trailing, "\n"),
-            #{<<"success">> => true, <<"output">> => list_to_binary(Trimmed)}
+            CleanResult = clean_output(Result),
+            #{<<"success">> => true, <<"output">> => CleanResult}
     end.
 
 run_command_impl(Cmd, _Timeout, Cwd) ->
@@ -1111,21 +1111,53 @@ run_command_impl(Cmd, _Timeout, Cwd) ->
 
 clean_output(String) when is_binary(String) ->
     % Remove ANSI escape codes from binary
+    % Truncate if too large
+    MaxSize = 50000,
     try
-        re:replace(String, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}])
+        Cleaned = re:replace(String, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}]),
+        case byte_size(Cleaned) of
+            Size when Size > MaxSize ->
+                <<Short:MaxSize/binary, _/binary>> = Cleaned,
+                <<Short/binary, "... (truncated)">>;
+            _ -> Cleaned
+        end
     catch
-        _:_ -> String
+        _:_ -> 
+            case byte_size(String) of
+                Size when Size > MaxSize ->
+                    <<Short:MaxSize/binary, _/binary>> = String,
+                    <<Short/binary, "... (truncated)">>;
+                _ -> String
+            end
     end;
 clean_output(String) when is_list(String) ->
     % Check if it's a printable string
+    MaxSize = 50000,
     case io_lib:printable_unicode_list(String) of
         true -> 
             % It's a string - convert to binary and clean
             try
                 Bin = unicode:characters_to_binary(String),
-                re:replace(Bin, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}])
+                Cleaned = re:replace(Bin, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}]),
+                case byte_size(Cleaned) of
+                    Size when Size > MaxSize ->
+                        <<Short:MaxSize/binary, _/binary>> = Cleaned,
+                        <<Short/binary, "... (truncated)">>;
+                    _ -> Cleaned
+                end
             catch
-                _:_ -> unicode:characters_to_binary(String)
+                _:_ -> 
+                    % Fallback - just truncate the original
+                    try
+                        Len = length(String),
+                        case Len > MaxSize of
+                            true -> 
+                                unicode:characters_to_binary(string:sub_string(String, 1, MaxSize) ++ "... (truncated)");
+                            false -> unicode:characters_to_binary(String)
+                        end
+                    catch
+                        _:_ -> <<"[output too large]">>
+                    end
             end;
         false ->
             % It's a nested structure - return as formatted string
@@ -1146,12 +1178,13 @@ clean_output(String) when is_list(String) ->
             end
     end;
 clean_output(Other) ->
-    % Fallback for any other type
+    % Fallback for any other type - format and truncate
     try
         Bin = iolist_to_binary(io_lib:format("~p", [Other])),
+        MaxSize = 50000,
         case byte_size(Bin) of
-            Size when Size > 10000 ->
-                <<FirstPart:10000/binary, _/binary>> = Bin,
+            Size when Size > MaxSize ->
+                <<FirstPart:MaxSize/binary, _/binary>> = Bin,
                 <<FirstPart/binary, "... (truncated)">>;
             _ -> Bin
         end
