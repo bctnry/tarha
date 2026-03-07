@@ -1,6 +1,7 @@
 -module(coding_agent_tools).
 -export([tools/0, execute/2, execute_concurrent/1]).
 -export([create_backup/1, restore_backup/1, list_backups/0, clear_backups/0]).
+-export([http_request/1, http_request/2]).
 -export([set_progress_callback/1, set_safety_callback/1]).
 -export([get_log/0, clear_log/0]).
 -export([start_lsp/1, start_index/1]).
@@ -25,7 +26,7 @@ safe_binary(Input) when is_binary(Input) ->
 safe_binary(Input) when is_list(Input) ->
     safe_binary(Input, ?MAX_TEXT_SIZE);
 safe_binary(Input) ->
-    safe_binary(iolist_to_binary(io_lib:format("~p", [Input])), ?MAX_TEXT_SIZE).
+    safe_binary_any(Input, ?MAX_TEXT_SIZE).
 
 safe_binary(Input, MaxSize) when is_binary(Input) ->
     case byte_size(Input) of
@@ -39,10 +40,78 @@ safe_binary(Input, MaxSize) when is_list(Input) ->
         Bin = unicode:characters_to_binary(Input),
         safe_binary(Bin, MaxSize)
     catch
-        _:_ -> safe_binary(iolist_to_binary(io_lib:format("~p", [Input])), MaxSize)
+        _:_ -> safe_binary_any(Input, MaxSize)
     end;
 safe_binary(Input, _MaxSize) ->
     safe_binary(Input).
+
+% Safe conversion for any term, handling deeply nested lists
+safe_binary_any(Term, MaxSize) ->
+    try
+        Flat = flatten_term(Term, MaxSize * 2),
+        Bin = unicode:characters_to_binary(Flat),
+        case byte_size(Bin) of
+            Size when Size > MaxSize ->
+                <<First:MaxSize/binary, _/binary>> = Bin,
+                <<First/binary, "... (truncated)">>;
+            _ -> Bin
+        end
+    catch
+        _:_ -> <<"[term too large to serialize]">>
+    end.
+
+% Recursively flatten a term into an iolist, with depth limit
+flatten_term(Bin, _MaxSize) when is_binary(Bin) -> Bin;
+flatten_term(Int, _MaxSize) when is_integer(Int) -> integer_to_binary(Int);
+flatten_term(Float, _MaxSize) when is_float(Float) -> float_to_binary(Float);
+flatten_term(Atom, _MaxSize) when is_atom(Atom) -> atom_to_binary(Atom);
+flatten_term([], _MaxSize) -> <<"[]">>;
+flatten_term({}, _MaxSize) -> <<"{}">>;
+flatten_term(List, MaxSize) when is_list(List) ->
+    case is_flat_string(List) of
+        true -> List;
+        false -> flatten_list(List, MaxSize, 0, [])
+    end;
+flatten_term(Map, MaxSize) when is_map(Map) ->
+    flatten_map(maps:to_list(Map), MaxSize);
+flatten_term(Tuple, MaxSize) when is_tuple(Tuple) ->
+    flatten_tuple(tuple_to_list(Tuple), MaxSize);
+flatten_term(Term, _MaxSize) ->
+    io_lib:format("~w", [Term]).
+
+is_flat_string([]) -> true;
+is_flat_string([H|T]) when is_integer(H), H >= 0, H =< 255 -> is_flat_string(T);
+is_flat_string(_) -> false.
+
+flatten_list([], _MaxSize, _Size, Acc) -> lists:reverse(Acc);
+flatten_list(_, MaxSize, Size, Acc) when Size > MaxSize -> 
+    lists:reverse([<<"...">> | Acc]);
+flatten_list([H|T], MaxSize, Size, Acc) ->
+    Flat = flatten_term(H, MaxSize),
+    NewSize = safe_iolist_size(Flat),
+    flatten_list(T, MaxSize, Size + NewSize, [Flat, <<" ">> | Acc]).
+
+flatten_map([], _MaxSize) -> <<"#{}">>;
+flatten_map(Pairs, MaxSize) ->
+    FlatPairs = flatten_map_pairs(Pairs, MaxSize, []),
+    [<<"#{">>, FlatPairs, <<"}">>].
+
+flatten_map_pairs([], _MaxSize, Acc) -> lists:reverse(Acc);
+flatten_map_pairs([{K, V}|Rest], MaxSize, Acc) ->
+    FlatK = flatten_term(K, MaxSize),
+    FlatV = flatten_term(V, MaxSize),
+    Pair = [FlatK, <<" => ">>, FlatV],
+    flatten_map_pairs(Rest, MaxSize, [Pair, <<", ">> | Acc]).
+
+flatten_tuple(Elems, MaxSize) ->
+    FlatElems = flatten_list(Elems, MaxSize, 0, []),
+    [<<"{">>, FlatElems, <<"}">>].
+
+safe_iolist_size(Bin) when is_binary(Bin) -> byte_size(Bin);
+safe_iolist_size(Int) when is_integer(Int) -> 1;
+safe_iolist_size([]) -> 0;
+safe_iolist_size([H|T]) -> safe_iolist_size(H) + safe_iolist_size(T);
+safe_iolist_size(_) -> 0.
 
 % Progress callback: fun((Operation, Status, Data) -> ok)
 set_progress_callback(Fun) when is_function(Fun, 3) ->
@@ -546,6 +615,53 @@ tools() ->
                     <<"required">> => []
                 }
             }
+        },
+        % HTTP Client
+        #{
+            <<"type">> => <<"function">>,
+            <<"function">> => #{
+                <<"name">> => <<"http_request">>,
+                <<"description">> => <<"Make an HTTP request to any URL. Supports GET, POST, PUT, DELETE, PATCH methods with headers and body.">>,
+                <<"parameters">> => #{
+                    <<"type">> => <<"object">>,
+                    <<"properties">> => #{
+                        <<"url">> => #{<<"type">> => <<"string">>, <<"description">> => <<"The URL to request">>},
+                        <<"method">> => #{<<"type">> => <<"string">>, <<"description">> => <<"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS). Default: GET">>},
+                        <<"headers">> => #{<<"type">> => <<"object">>, <<"description">> => <<"HTTP headers as key-value pairs">>},
+                        <<"body">> => #{<<"type">> => <<"string">>, <<"description">> => <<"Request body (for POST, PUT, PATCH)">>},
+                        <<"timeout">> => #{<<"type">> => <<"integer">>, <<"description">> => <<"Timeout in milliseconds (default: 30000)">>},
+                        <<"follow_redirect">> => #{<<"type">> => <<"boolean">>, <<"description">> => <<"Follow redirects (default: true)">>},
+                        <<"response_format">> => #{<<"type">> => <<"string">>, <<"description">> => <<"Response format: 'json', 'text', 'binary'. Default: auto-detect">>}
+                    },
+                    <<"required">> => [<<"url">>]
+                }
+            }
+        },
+        % Parallel Execution
+        #{
+            <<"type">> => <<"function">>,
+            <<"function">> => #{
+                <<"name">> => <<"execute_parallel">>,
+                <<"description">> => <<"Execute multiple tool calls in parallel. Use this when you need to run independent operations concurrently for better performance.">>,
+                <<"parameters">> => #{
+                    <<"type">> => <<"object">>,
+                    <<"properties">> => #{
+                        <<"calls">> => #{
+                            <<"type">> => <<"array">>,
+                            <<"description">> => <<"Array of tool calls to execute in parallel. Each call is an object with 'name' (tool name) and 'args' (arguments object).">>,
+                            <<"items">> => #{
+                                <<"type">> => <<"object">>,
+                                <<"properties">> => #{
+                                    <<"name">> => #{<<"type">> => <<"string">>, <<"description">> => <<"Tool name to call">>},
+                                    <<"args">> => #{<<"type">> => <<"object">>, <<"description">> => <<"Arguments for the tool call">>}
+                                },
+                                <<"required">> => [<<"name">>, <<"args">>]
+                            }
+                        }
+                    },
+                    <<"required">> => [<<"calls">>]
+                }
+            }
         }
     ].
 
@@ -992,6 +1108,21 @@ execute(<<"hello">>, _Args) ->
     io:format("hello world~n"),
     #{<<"success">> => true, <<"message">> => <<"hello world">>};
 
+% HTTP Client
+execute(<<"http_request">>, Args) ->
+    Url = maps:get(<<"url">>, Args),
+    Method = maps:get(<<"method">>, Args, <<"GET">>),
+    Headers = maps:get(<<"headers">>, Args, #{}),
+    Body = maps:get(<<"body">>, Args, undefined),
+    Timeout = maps:get(<<"timeout">>, Args, 30000),
+    FollowRedirect = maps:get(<<"follow_redirect">>, Args, true),
+    ResponseFormat = maps:get(<<"response_format">>, Args, <<"auto">>),
+    http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat);
+
+% Parallel Execution
+execute(<<"execute_parallel">>, #{<<"calls">> := Calls}) ->
+    execute_parallel_impl(Calls);
+
 execute(_Tool, _Args) ->
     #{<<"success">> => false, <<"error">> => <<"Unknown tool">>}.
 
@@ -1142,25 +1273,17 @@ run_command_impl(Cmd, _Timeout, Cwd) ->
     end.
 
 clean_output(String) when is_binary(String) ->
-    % Remove ANSI escape codes from binary
-    % Truncate if too large
     MaxSize = 50000,
-    try
-        Cleaned = re:replace(String, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}]),
-        case byte_size(Cleaned) of
-            Size when Size > MaxSize ->
-                <<Short:MaxSize/binary, _/binary>> = Cleaned,
-                <<Short/binary, "... (truncated)">>;
-            _ -> Cleaned
-        end
+    Cleaned = try
+        re:replace(String, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}])
     catch
-        _:_ -> 
-            case byte_size(String) of
-                Size when Size > MaxSize ->
-                    <<Short:MaxSize/binary, _/binary>> = String,
-                    <<Short/binary, "... (truncated)">>;
-                _ -> String
-            end
+        _:_ -> String
+    end,
+    case byte_size(Cleaned) of
+        Size when Size > MaxSize ->
+            <<Short:MaxSize/binary, _/binary>> = Cleaned,
+            <<Short/binary, "... (truncated)">>;
+        _ -> Cleaned
     end;
 clean_output(String) when is_list(String) ->
     % Check if it's a printable string
@@ -2083,3 +2206,170 @@ find_function_callers(FilePath, Function) ->
         <<"callers">> => Callers,
         <<"count">> => length(Callers)
     }.
+
+%% HTTP Request Implementation
+%% Public API for direct use
+
+http_request(Url) ->
+    http_request(Url, #{}).
+
+http_request(Url, Opts) when is_list(Url) ->
+    http_request(list_to_binary(Url), Opts);
+http_request(Url, Opts) when is_binary(Url), is_map(Opts) ->
+    Method = maps:get(<<"method">>, Opts, <<"GET">>),
+    Headers = maps:get(<<"headers">>, Opts, #{}),
+    Body = maps:get(<<"body">>, Opts, undefined),
+    Timeout = maps:get(<<"timeout">>, Opts, 30000),
+    FollowRedirect = maps:get(<<"follow_redirect">>, Opts, true),
+    ResponseFormat = maps:get(<<"response_format">>, Opts, <<"auto">>),
+    http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat).
+
+http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat) ->
+    % Ensure hackney is started
+    case application:ensure_all_started(hackney) of
+        {ok, _} -> ok;
+        _ -> ok
+    end,
+    
+    report_progress(<<"http_request">>, <<"starting">>, #{url => Url, method => Method}),
+    
+    % Convert method to atom
+    MethodAtom = case Method of
+        <<"GET">> -> get;
+        <<"POST">> -> post;
+        <<"PUT">> -> put;
+        <<"DELETE">> -> delete;
+        <<"PATCH">> -> patch;
+        <<"HEAD">> -> head;
+        <<"OPTIONS">> -> options;
+        _ -> get
+    end,
+    
+    % Convert headers to list
+    HeaderList = maps:fold(fun(K, V, Acc) ->
+        [{iolist_to_binary(K), iolist_to_binary(V)} | Acc]
+    end, [], Headers),
+    
+    % Build request options
+    ReqOpts = [{recv_timeout, Timeout}],
+    ReqOpts1 = case FollowRedirect of
+        true -> [{follow_redirect, true} | ReqOpts];
+        false -> ReqOpts
+    end,
+    
+    % Make request
+    Result = case MethodAtom of
+        get ->
+            hackney:request(get, Url, HeaderList, <<>>, ReqOpts1);
+        head ->
+            hackney:request(head, Url, HeaderList, <<>>, ReqOpts1);
+        _ when Body =:= undefined; Body =:= nil ->
+            hackney:request(MethodAtom, Url, HeaderList, <<>>, ReqOpts1);
+        _ ->
+            hackney:request(MethodAtom, Url, HeaderList, Body, ReqOpts1)
+    end,
+    
+    case Result of
+        {ok, StatusCode, RespHeaders, RespBody} when StatusCode >= 200, StatusCode < 300 ->
+            process_http_response(StatusCode, RespHeaders, RespBody, ResponseFormat, Url);
+        {ok, StatusCode, RespHeaders, RespBody} ->
+            process_http_response(StatusCode, RespHeaders, RespBody, ResponseFormat, Url);
+        {error, Reason} ->
+            #{
+                <<"success">> => false,
+                <<"error">> => iolist_to_binary(io_lib:format("HTTP request failed: ~p", [Reason]))
+            }
+    end.
+
+process_http_response(StatusCode, RespHeaders, RespBody, ResponseFormat, Url) ->
+    % Auto-detect format if needed
+    DetectedFormat = case ResponseFormat of
+        <<"auto">> -> detect_response_format(RespHeaders, RespBody);
+        Other -> Other
+    end,
+    
+    % Truncate large responses
+    SafeBody = safe_binary(RespBody, 100000),
+    
+    % Parse body based on format
+    ParsedBody = case DetectedFormat of
+        <<"json">> ->
+            case jsx:is_json(SafeBody) of
+                true -> jsx:decode(SafeBody, [return_maps]);
+                false -> SafeBody
+            end;
+        _ -> SafeBody
+    end,
+    
+    % Convert headers to map
+    HeaderMap = lists:foldl(fun({K, V}, Acc) ->
+        Acc#{iolist_to_binary(K) => iolist_to_binary(V)}
+    end, #{}, RespHeaders),
+    
+    #{
+        <<"success">> => true,
+        <<"status">> => StatusCode,
+        <<"headers">> => HeaderMap,
+        <<"body">> => ParsedBody,
+        <<"url">> => Url,
+        <<"format">> => DetectedFormat
+    }.
+
+detect_response_format(Headers, _Body) ->
+    % Check content-type header
+    ContentType = case lists:keyfind(<<"content-type">>, 1, Headers) of
+        {_, CT} -> string:lowercase(CT);
+        false -> <<"unknown">>
+    end,
+    
+    case binary:match(ContentType, <<"application/json">>) of
+        nomatch -> ok;
+        _ -> ok
+    end,
+    
+    % Determine format based on content-type
+    IsJson = binary:match(ContentType, <<"application/json">>) =/= nomatch,
+    IsText = binary:match(ContentType, <<"text/">>) =/= nomatch,
+    IsImage = binary:match(ContentType, <<"image/">>) =/= nomatch,
+    
+    case {IsJson, IsText, IsImage} of
+        {true, _, _} -> <<"json">>;
+        {_, true, _} -> <<"text">>;
+        {_, _, true} -> <<"binary">>;
+        _ -> <<"text">>
+    end.
+
+%% Parallel Execution Implementation
+execute_parallel_impl(Calls) when is_list(Calls) ->
+    Parent = self(),
+    
+    % Spawn a process for each call
+    Pids = lists:map(fun(#{<<"name">> := Name, <<"args">> := Args}) ->
+        spawn_link(fun() ->
+            Result = execute(Name, Args),
+            Parent ! {parallel_result, self(), Name, Result}
+        end)
+    end, Calls),
+    
+    % Collect results
+    Results = collect_parallel_results(Pids, #{}),
+    
+    #{
+        <<"success">> => true,
+        <<"results">> => Results,
+        <<"count">> => length(Calls)
+    };
+execute_parallel_impl(Calls) ->
+    #{<<"success">> => false, <<"error">> => <<"calls must be an array">>}.
+
+collect_parallel_results([], Results) ->
+    Results;
+collect_parallel_results(Pids, Results) ->
+    receive
+        {parallel_result, Pid, Name, Result} ->
+            NewPids = lists:delete(Pid, Pids),
+            collect_parallel_results(NewPids, Results#{Name => Result})
+    after 120000 ->
+        % Timeout - return what we have
+        #{<<"error">> => <<"timeout">>}
+    end.

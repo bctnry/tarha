@@ -20,7 +20,7 @@
 -define(MAX_ITERATIONS, 100).
 -define(MAX_HISTORY, 100).
 -define(MAX_TOKENS, 80000).  % Compaction threshold - when exceeded, summarize context
--define(COMPACTION_THRESHOLD, 60000).  % Trigger compaction when tokens exceed this
+-define(COMPACTION_THRESHOLD, 300000).  % Trigger compaction when tokens exceed this
 -define(ARCHIVE_DIR, ".tarha/sessions").
 -define(MAX_TOOL_RETRIES, 3).
 -define(SESSIONS_TABLE, coding_agent_sessions).
@@ -465,8 +465,15 @@ handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles) ->
 estimate_message_size(Messages) ->
     lists:foldl(fun(Msg, Acc) ->
         Content = maps:get(<<"content">>, Msg, <<"">>),
-        Acc + byte_size(Content)
+        Acc + safe_byte_size(Content)
     end, 0, Messages).
+
+safe_byte_size(Bin) when is_binary(Bin) -> byte_size(Bin);
+safe_byte_size(List) when is_list(List) ->
+    try erlang:iolist_size(List)
+    catch _:_ -> length(List)
+    end;
+safe_byte_size(_) -> 0.
 
 execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
     Results = [execute_single_tool_with_retry(TC, OpenFiles) || TC <- ToolCalls],
@@ -481,9 +488,14 @@ execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
     ResultList = [R || {R, _} <- Results],
     % Limit result size to prevent crashes on large git status/diff output
     SafeResults = limit_results(ResultList, 100000),
-    ResultBin = try iolist_to_binary(io_lib:format("~p", [SafeResults]))
-    catch _:_ -> <<"[result too large]">> end,
+    ResultBin = serialize_results(SafeResults),
     {ResultBin, NewOpenFiles}.
+
+serialize_results(Results) ->
+    try jsx:encode(Results)
+    catch
+        _:_ -> <<"[result serialization failed]">>
+    end.
 
 limit_results(Results, MaxSize) when is_list(Results) ->
     limit_results(Results, MaxSize, 0, []);
