@@ -521,7 +521,6 @@ process_message(SessionId, History, Input, RetryCount) ->
     io:format("~nThinking...~n"),
     try coding_agent_session:ask(SessionId, Message) of
         {ok, Response, _Thinking, _History} ->
-            %% Thinking is already displayed by the session module before tool calls
             io:format("~n--- Response ---~n"),
             print_response(Response),
             io:format("~n"),
@@ -530,7 +529,6 @@ process_message(SessionId, History, Input, RetryCount) ->
             io:format("~nSession expired. Creating new session...~n"),
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
-            % Retry with new session (reset retry count)
             process_message(NewSessionId, NewHistory, Input, 0);
         {error, Reason} ->
             io:format("Error: ~p~n~n", [Reason]),
@@ -541,11 +539,17 @@ process_message(SessionId, History, Input, RetryCount) ->
             io:format("~nRequest timed out. Retrying (~p/3)...~n", [RetryCount + 1]),
             timer:sleep(1000 * (RetryCount + 1)),
             process_message(SessionId, History, Input, RetryCount + 1);
+        error:undef:Stacktrace ->
+            io:format("~n⚠ Undefined function error:~n"),
+            lists:foreach(fun({M, F, A, Loc}) ->
+                io:format("  ~p:~p/~p at ~p~n", [M, F, A, Loc])
+            end, Stacktrace),
+            io:format("~nPlease recompile and restart.~n"),
+            {continue, History};
         Type:Error:Stacktrace ->
             io:format("~n⚠ Session crashed: ~p:~p~n", [Type, Error]),
             report_crash(Type, Error, Stacktrace, SessionId),
             io:format("Creating new session and continuing...~n"),
-            % Remove dead session from ETS
             ets:delete(coding_agent_sessions, SessionId),
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
@@ -569,16 +573,21 @@ report_error(Reason, SessionId) ->
     end.
 
 report_crash(Type, Error, Stacktrace, SessionId) ->
-    case whereis(coding_agent_healer) of
-        undefined -> ok;
-        _ ->
-            coding_agent_healer:report_crash(repl_crash, {Type, Error}, Stacktrace, #{session_id => SessionId}),
-            io:format("Crash logged.~n"),
-            {_, CrashAnalysis} = coding_agent_healer:analyze_crash(Type, Stacktrace),
-            case maps:get(suggested_fix, CrashAnalysis, #{}) of
-                #{hint := Hint} -> io:format("Suggestion: ~s~n", [Hint]);
-                _ -> ok
-            end
+    try
+        case whereis(coding_agent_healer) of
+            undefined -> ok;
+            _ ->
+                coding_agent_healer:report_crash(repl_crash, {Type, Error}, Stacktrace, #{session_id => SessionId}),
+                io:format("Crash logged.~n"),
+                {_, CrashAnalysis} = coding_agent_healer:analyze_crash(Type, Stacktrace),
+                case maps:get(suggested_fix, CrashAnalysis, #{}) of
+                    #{hint := Hint} -> io:format("Suggestion: ~s~n", [Hint]);
+                    _ -> ok
+                end
+        end
+    catch
+        _:_ -> 
+            io:format("Could not log crash (healer unavailable).~n")
     end.
 
 report_error(Reason) ->

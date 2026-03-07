@@ -58,4 +58,9 @@ erl_crash.dump
 .tarha/backups/
 .tarha/reports/
 .tarha/sessions/*.json
+.tarha/history
 dump.txt
+
+# Test/temp files
+test_command_matching*
+COMMAND_MATCHING_TEST_RESULTS.md
