@@ -872,7 +872,10 @@ execute(<<"git_commit">>, #{<<"message">> := Msg} = Args) ->
         proceed ->
             MsgStr = binary_to_list(Msg),
             SafeMsg = lists:filter(fun(C) -> C =/= $' andalso C =/= $" end, MsgStr),
-            Cmd = "git commit -m '" ++ SafeMsg ++ "'",
+            % Add Co-Authored-By trailer
+            CoAuthoredBy = "\n\nCo-Authored-By: TriusAI Tarha <trius@canton.graphics>",
+            FullMsg = SafeMsg ++ CoAuthoredBy,
+            Cmd = "git commit -m '" ++ FullMsg ++ "'",
             run_git_command(Cmd)
     end;
 
@@ -993,17 +996,20 @@ execute(<<"smart_commit">>, Args) ->
                     #{<<"success">> => false, <<"error">> => <<"No staged changes. Use git add first.">>};
                 Diff ->
                     CommitMsg = generate_commit_message(Diff),
+                    % Add Co-Authored-By trailer
+                    CoAuthoredBy = <<"\n\nCo-Authored-By: TriusAI Tarha <trius@canton.graphics>">>,
+                    FullMsg = <<CommitMsg/binary, CoAuthoredBy/binary>>,
                     case Preview of
                         true ->
                             #{<<"success">> => true, 
                               <<"preview">> => true,
-                              <<"message">> => CommitMsg,
+                              <<"message">> => FullMsg,
                                 <<"diff">> => clean_output(string:trim(Diff, trailing))};
                         false ->
-                            CommitCmd = "git commit -m '" ++ binary_to_list(CommitMsg) ++ "'",
+                            CommitCmd = "git commit -m '" ++ binary_to_list(FullMsg) ++ "'",
                             Result = os:cmd(CommitCmd ++ " 2>&1"),
                             #{<<"success">> => true,
-                              <<"message">> => CommitMsg,
+                              <<"message">> => FullMsg,
                                 <<"output">> => clean_output(string:trim(Result, trailing))}
                     end
             end
