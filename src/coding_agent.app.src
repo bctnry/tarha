@@ -13,8 +13,7 @@
     ranch
    ]},
   {env,
-   [{ollama_host, "http://localhost:11434"},
-    {model, "glm-5:cloud"}
+   [{ollama_host, "http://localhost:11434"}
    ]},
       {modules,
        [coding_agent_app,
