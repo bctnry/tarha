@@ -895,7 +895,7 @@ insert_validation(Content, ClauseStart, _ClauseEnd, ValidationCode) ->
 add_wildcard_clause(Content, F, A, InsertPos) ->
     Lines = binary:split(Content, <<"\n">>, [global]),
     % Generate wildcard clause
-    Args = [<<"_", integer_to_binary(N)>> || N <- lists:seq(1, A)],
+    Args = [<<"_", (integer_to_binary(N))/binary>> || N <- lists:seq(1, A)],
     WildcardClause = io_lib:format("~s(~s) ->\n    erlang:error(not_implemented).", 
         [F, string:join([binary_to_list(A) || A <- Args], ", ")]),
     {Before, After} = lists:split(InsertPos + 1, Lines),
@@ -907,7 +907,7 @@ add_function_clause(Content, F, A) ->
     % Find the function definition
     {FuncLines, RestLines} = find_function_lines(Lines, atom_to_binary(F, utf8), A),
     % Add a catch-all clause
-    Args = [<<"_", integer_to_binary(N)>> || N <- lists:seq(1, A)],
+    Args = [<<"_", (integer_to_binary(N))/binary>> || N <- lists:seq(1, A)],
     CatchAll = iolist_to_binary(io_lib:format("~s(~s) ->\n    erlang:error(not_implemented).", 
         [F, string:join([binary_to_list(A) || A <- Args], ", ")])),
     % Insert before the next function or at the end
@@ -974,16 +974,6 @@ count_args(Line, Arity) ->
             end;
         none ->
             false
-    end.
-
-find_case_end([], _, _) -> error;
-find_case_end([Line | Rest], LineNum, Depth) ->
-    HasEnd = binary:match(Line, <<"end">>) =/= nomatch,
-    HasCase = binary:match(Line, <<"case ">>) =/= nomatch,
-    NewDepth = Depth + (case HasCase of true -> 1; false -> 0 end) - (case HasEnd of true -> 1; false -> 0 end),
-    case NewDepth of
-        0 -> {ok, LineNum};
-        _ -> find_case_end(Rest, LineNum + 1, NewDepth)
     end.
 
 add_catch_all_case(Content, StartLine, EndLine) ->

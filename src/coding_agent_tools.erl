@@ -11,6 +11,8 @@
 -define(MAX_BACKUPS, 50).
 -define(OPS_LOG, coding_agent_ops_log).
 -define(MAX_TEXT_SIZE, 50000).
+-define(PROGRESS_CALLBACK, coding_agent_progress_cb).
+-define(SAFETY_CALLBACK, coding_agent_safety_cb).
 
 % Safely convert to binary with size limit
 safe_binary(Input) when is_binary(Input) ->

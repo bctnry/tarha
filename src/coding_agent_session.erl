@@ -487,7 +487,13 @@ execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
                 <<FirstPart/binary, "... (truncated)">>;
             _ -> Bin
         end
-    catch _:_ -> <<"[error serializing result]">> end,
+    catch 
+        _:_ -> 
+            % If iolist_to_binary fails, try a simpler approach
+            try list_to_binary(string:substr(io_lib:format("~p", [ResultList]), 1, 50000))
+            catch _:_ -> <<"[result too large to display]">>
+            end
+    end,
     {ResultBin, NewOpenFiles}.
 
 execute_single_tool_with_retry(TC, OpenFiles) ->
