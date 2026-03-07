@@ -966,14 +966,55 @@ format_crashes_text(Crashes) ->
 
 % Helper to extract context length from model_info
 find_context_length(ModelInfo) when is_map(ModelInfo) ->
-    Keys = [<<"context_length">>, <<"num_ctx">>, <<"n_ctx">>],
-    lists:foldl(fun(Key, Acc) ->
+    % Check multiple locations where context length might be defined
+    % 1. Top-level model_info field
+    % 2. Nested model_info inside model_info
+    % 3. Direct fields in details or parameters
+    
+    TopKeys = [<<"context_length">>, <<"num_ctx">>, <<"n_ctx">>],
+    
+    % Check top level first
+    TopLevel = lists:foldl(fun(Key, Acc) ->
         case Acc of
             undefined -> maps:get(Key, ModelInfo, undefined);
             _ -> Acc
         end
-    end, undefined, Keys);
+    end, undefined, TopKeys),
+    
+    % Check model_info field (some models have it nested)
+    NestedInfo = case maps:get(<<"model_info">>, ModelInfo, undefined) of
+        Nested when is_map(Nested) ->
+            lists:foldl(fun(Key, Acc) ->
+                case Acc of
+                    undefined -> maps:get(Key, Nested, undefined);
+                    _ -> Acc
+                end
+            end, undefined, TopKeys);
+        _ -> undefined
+    end,
+    
+    % Check details field
+    DetailsCtx = case maps:get(<<"details">>, ModelInfo, undefined) of
+        Details when is_map(Details) ->
+            lists:foldl(fun(Key, Acc) ->
+                case Acc of
+                    undefined -> maps:get(Key, Details, undefined);
+                    _ -> Acc
+                end
+            end, undefined, TopKeys);
+        _ -> undefined
+    end,
+    
+    % Return first found
+    find_first([TopLevel, NestedInfo, DetailsCtx]);
 find_context_length(_) ->
+    undefined.
+
+find_first([undefined | Rest]) ->
+    find_first(Rest);
+find_first([Value | _]) ->
+    Value;
+find_first([]) ->
     undefined.
 
 print_response(<<>>) ->

@@ -457,26 +457,59 @@ get_model_context_length(Model) ->
 
 get_model_context_length(Model, Default) when is_binary(Model) ->
     case get_model_info(Model) of
-        {ok, #{<<"parameters">> := Params}} when is_map(Params) ->
-            case extract_context_length(Params) of
-                undefined -> Default;
-                Len when is_integer(Len), Len > 0 -> Len;
-                _ -> Default
-            end;
+        {ok, ModelInfo} when is_map(ModelInfo) ->
+            extract_context_length_from_model_info(ModelInfo, Default);
         _ ->
             Default
     end;
 get_model_context_length(Model, Default) when is_list(Model) ->
     get_model_context_length(list_to_binary(Model), Default).
 
-extract_context_length(Params) when is_map(Params) ->
+extract_context_length_from_model_info(ModelInfo, Default) ->
     Keys = [<<"context_length">>, <<"num_ctx">>, <<"n_ctx">>],
+    
+    % Check top level
+    TopLevel = find_first_key(ModelInfo, Keys),
+    
+    % Check model_info field (nested)
+    NestedModelInfo = case maps:get(<<"model_info">>, ModelInfo, undefined) of
+        MI when is_map(MI) -> find_first_key(MI, Keys);
+        _ -> undefined
+    end,
+    
+    % Check parameters field
+    ParamsCtx = case maps:get(<<"parameters">>, ModelInfo, undefined) of
+        P when is_map(P) -> find_first_key(P, Keys);
+        _ -> undefined
+    end,
+    
+    % Check details field
+    DetailsCtx = case maps:get(<<"details">>, ModelInfo, undefined) of
+        D when is_map(D) -> find_first_key(D, Keys);
+        _ -> undefined
+    end,
+    
+    case find_first([TopLevel, NestedModelInfo, ParamsCtx, DetailsCtx]) of
+        Len when is_integer(Len), Len > 0 -> Len;
+        _ -> Default
+    end.
+
+find_first_key(Map, Keys) when is_map(Map) ->
     lists:foldl(fun(Key, Acc) ->
         case Acc of
-            undefined -> maps:get(Key, Params, undefined);
+            undefined -> maps:get(Key, Map, undefined);
             _ -> Acc
         end
-    end, undefined, Keys).
+    end, undefined, Keys);
+find_first_key(_, _) ->
+    undefined.
+
+find_first([undefined | Rest]) ->
+    find_first(Rest);
+find_first([Value | _]) ->
+    Value;
+find_first([]) ->
+    undefined.
 
 get_model_info(Model) ->
     show_model(Model, #{}).
