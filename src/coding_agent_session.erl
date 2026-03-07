@@ -479,22 +479,41 @@ execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
         (_, Acc) -> Acc
     end, OpenFiles, Results),
     ResultList = [R || {R, _} <- Results],
-    ResultBin = try 
-        Bin = iolist_to_binary(io_lib:format("~p", [ResultList])),
-        case byte_size(Bin) of
-            Size when Size > 50000 ->
-                <<FirstPart:50000/binary, _/binary>> = Bin,
-                <<FirstPart/binary, "... (truncated)">>;
-            _ -> Bin
-        end
-    catch 
-        _:_ -> 
-            % If iolist_to_binary fails, try a simpler approach
-            try list_to_binary(string:substr(io_lib:format("~p", [ResultList]), 1, 50000))
-            catch _:_ -> <<"[result too large to display]">>
-            end
-    end,
+    % Limit result size to prevent crashes on large git status/diff output
+    SafeResults = limit_results(ResultList, 100000),
+    ResultBin = try iolist_to_binary(io_lib:format("~p", [SafeResults]))
+    catch _:_ -> <<"[result too large]">> end,
     {ResultBin, NewOpenFiles}.
+
+limit_results(Results, MaxSize) when is_list(Results) ->
+    limit_results(Results, MaxSize, 0, []);
+limit_results(Results, _MaxSize) ->
+    Results.
+
+limit_results([], _MaxSize, _CurrentSize, Acc) ->
+    lists:reverse(Acc);
+limit_results([Result | Rest], MaxSize, CurrentSize, Acc) when CurrentSize > MaxSize ->
+    lists:reverse(Acc);
+limit_results([#{<<"success">> := true, <<"output">> := Output} = Result | Rest], MaxSize, CurrentSize, Acc) ->
+    OutputSize = case is_binary(Output) of
+        true -> byte_size(Output);
+        _ -> 0
+    end,
+    case CurrentSize + OutputSize of
+        NewSize when NewSize > MaxSize ->
+            % Truncate this result
+            Truncated = case is_binary(Output) of
+                true when byte_size(Output) > 5000 ->
+                    <<First:5000/binary, _/binary>> = Output,
+                    maps:put(<<"output">>, <<First/binary, "...">>, Result);
+                _ -> Result
+            end,
+            lists:reverse([Truncated | Acc]);
+        NewSize ->
+            limit_results(Rest, MaxSize, NewSize, [Result | Acc])
+    end;
+limit_results([Result | Rest], MaxSize, CurrentSize, Acc) ->
+    limit_results(Rest, MaxSize, CurrentSize, [Result | Acc]).
 
 execute_single_tool_with_retry(TC, OpenFiles) ->
     execute_single_tool_with_retry(TC, OpenFiles, 0).
