@@ -4,15 +4,43 @@
 -export([set_progress_callback/1, set_safety_callback/1]).
 -export([get_log/0, clear_log/0]).
 -export([start_lsp/1, start_index/1]).
+-export([safe_binary/1, safe_binary/2]).
 -include_lib("kernel/include/file.hrl").
 
 -define(BACKUP_DIR, ".tarha/backups").
 -define(MAX_BACKUPS, 50).
 -define(OPS_LOG, coding_agent_ops_log).
+-define(MAX_TEXT_SIZE, 50000).
 
-% Callbacks for progress and safety
--define(PROGRESS_CALLBACK, coding_agent_progress_cb).
--define(SAFETY_CALLBACK, coding_agent_safety_cb).
+% Safely convert to binary with size limit
+safe_binary(Input) when is_binary(Input) ->
+    case byte_size(Input) of
+        Size when Size > ?MAX_TEXT_SIZE ->
+            <<First:?MAX_TEXT_SIZE/binary, _/binary>> = Input,
+            <<First/binary, "... (truncated)">>;
+        _ -> Input
+    end;
+safe_binary(Input) when is_list(Input) ->
+    safe_binary(Input, ?MAX_TEXT_SIZE);
+safe_binary(Input) ->
+    safe_binary(iolist_to_binary(io_lib:format("~p", [Input])), ?MAX_TEXT_SIZE).
+
+safe_binary(Input, MaxSize) when is_binary(Input) ->
+    case byte_size(Input) of
+        Size when Size > MaxSize ->
+            <<First:MaxSize/binary, _/binary>> = Input,
+            <<First/binary, "... (truncated)">>;
+        _ -> Input
+    end;
+safe_binary(Input, MaxSize) when is_list(Input) ->
+    try
+        Bin = unicode:characters_to_binary(Input),
+        safe_binary(Bin, MaxSize)
+    catch
+        _:_ -> safe_binary(iolist_to_binary(io_lib:format("~p", [Input])), MaxSize)
+    end;
+safe_binary(Input, _MaxSize) ->
+    safe_binary(Input).
 
 % Progress callback: fun((Operation, Status, Data) -> ok)
 set_progress_callback(Fun) when is_function(Fun, 3) ->
@@ -577,9 +605,11 @@ execute(<<"read_file">>, #{<<"path">> := Path}) ->
     PathStr = sanitize_path(Path),
     case file:read_file(PathStr) of
         {ok, Content} ->
-            Result = #{<<"success">> => true, <<"content">> => Content},
+            % Truncate large files
+            SafeContent = safe_binary(Content),
+            Result = #{<<"success">> => true, <<"content">> => SafeContent},
             log_operation(<<"read_file">>, Path, Result),
-            report_progress(<<"read_file">>, <<"complete">>, #{path => Path, size => byte_size(Content)}),
+            report_progress(<<"read_file">>, <<"complete">>, #{path => Path, size => byte_size(SafeContent)}),
             Result;
         {error, Reason} ->
             Result = #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))},
@@ -850,13 +880,13 @@ execute(<<"smart_commit">>, Args) ->
                             #{<<"success">> => true, 
                               <<"preview">> => true,
                               <<"message">> => CommitMsg,
-                                <<"diff">> => unicode:characters_to_binary(string:trim(Diff, trailing))};
+                                <<"diff">> => clean_output(string:trim(Diff, trailing))};
                         false ->
                             CommitCmd = "git commit -m '" ++ binary_to_list(CommitMsg) ++ "'",
                             Result = os:cmd(CommitCmd ++ " 2>&1"),
                             #{<<"success">> => true,
                               <<"message">> => CommitMsg,
-                                <<"output">> => unicode:characters_to_binary(string:trim(Result, trailing))}
+                                <<"output">> => clean_output(string:trim(Result, trailing))}
                     end
             end
     end;
@@ -881,7 +911,7 @@ execute(<<"review_changes">>, Args) ->
             Review = analyze_diff(Diff),
             #{
                 <<"success">> => true,
-                            <<"diff">> => unicode:characters_to_binary(string:trim(Diff, trailing)),
+                            <<"diff">> => clean_output(string:trim(Diff, trailing)),
                 <<"review">> => Review,
                 <<"summary">> => generate_review_summary(Diff)
             }
@@ -1735,18 +1765,19 @@ fetch_crates_docs(Url) ->
 fetch_url(Url, _Opts) ->
     case hackney:get(Url, [], <<>>, [{follow_redirect, true}, {recv_timeout, 10000}]) of
         {ok, 200, _Headers, Body} ->
-            case jsx:is_json(Body) of
+            SafeBody = safe_binary(Body),
+            case jsx:is_json(SafeBody) of
                 true ->
-                    Data = jsx:decode(Body, [return_maps]),
+                    Data = jsx:decode(SafeBody, [return_maps]),
                     #{
                         <<"success">> => true,
                         <<"name">> => maps:get(<<"name">>, Data, <<>>),
-                        <<"description">> => maps:get(<<"description">>, Data, <<>>),
+                        <<"description">> => safe_binary(maps:get(<<"description">>, Data, <<>>)),
                         <<"version">> => maps:get(<<"version">>, Data, maps:get(<<"latest_version">>, Data, <<>>)),
                         <<"url">> => list_to_binary(Url)
                     };
                 false ->
-                    #{<<"success">> => true, <<"content">> => Body, <<"url">> => list_to_binary(Url)}
+                    #{<<"success">> => true, <<"content">> => SafeBody, <<"url">> => list_to_binary(Url)}
             end;
         {ok, Status, _Headers, _Body} ->
             {error, "HTTP error: " ++ integer_to_list(Status)};
