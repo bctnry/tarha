@@ -1,9 +1,39 @@
 -module(coding_agent_ollama).
 -export([generate/2, generate_stream/2, chat/2, chat_with_tools/3, chat_stream/3, chat_stream/4]).
--export([count_tokens/1, truncate_messages/2]).
+-export([count_tokens/1, count_tokens_accurate/2, truncate_messages/2]).
+-export([start_token_cache/0, clear_token_cache/0]).
 
 -define(MAX_RETRIES, 20).
 -define(RETRY_DELAY_BASE, 1000).  % 1 second base, exponential backoff.
+-define(TOKEN_CACHE_TABLE, coding_agent_token_cache).
+-define(TOKEN_CACHE_MAX_SIZE, 10000).  % Max cached entries
+
+%% Token counting strategies:
+%% 1. Accurate (count_tokens_accurate/2): Uses Ollama API to count tokens (when available)
+%% 2. Fast estimate (count_tokens/1): Char-based heuristic (~4 chars/token for English, ~2.5 for code)
+
+start_token_cache() ->
+    case ets:whereis(?TOKEN_CACHE_TABLE) of
+        undefined -> 
+            ets:new(?TOKEN_CACHE_TABLE, [set, public, named_table, {read_concurrency, true}]),
+            ok;
+        _ -> ok
+    end.
+
+clear_token_cache() ->
+    case ets:whereis(?TOKEN_CACHE_TABLE) of
+        undefined -> ok;
+        _ -> ets:delete_all_objects(?TOKEN_CACHE_TABLE)
+    end.
+
+%% Get token cache table, create if needed
+get_token_cache() ->
+    case ets:whereis(?TOKEN_CACHE_TABLE) of
+        undefined ->
+            ets:new(?TOKEN_CACHE_TABLE, [set, public, named_table, {read_concurrency, true}]),
+            ?TOKEN_CACHE_TABLE;
+        T -> T
+    end.
 
 do_with_retry(Fun) ->
     do_with_retry(Fun, 0).
@@ -133,7 +163,19 @@ do_chat_with_tools(Model, Messages, Tools) ->
     
     case hackney:request(post, Url, Headers, Body, [{recv_timeout, 300000}, with_body]) of
         {ok, 200, _RespHeaders, RespBody} ->
-            {ok, jsx:decode(RespBody, [return_maps])};
+            Resp = jsx:decode(RespBody, [return_maps]),
+            %% Extract token counts from response
+            PromptTokens = maps:get(<<"prompt_eval_count">>, Resp, undefined),
+            CompletionTokens = maps:get(<<"eval_count">>, Resp, undefined),
+            TokenInfo = #{
+                prompt_tokens => PromptTokens,
+                completion_tokens => CompletionTokens,
+                total_tokens => case {PromptTokens, CompletionTokens} of
+                    {P, C} when is_integer(P), is_integer(C) -> P + C;
+                    _ -> undefined
+                end
+            },
+            {ok, Resp#{token_info => TokenInfo}};
         {ok, StatusCode, _RespHeaders, RespBody} ->
             {error, {status, StatusCode, RespBody}};
         {error, Reason} ->
@@ -239,15 +281,24 @@ collect_chat_stream(Callback, ResponseAcc, ThinkingAcc, ContentAcc) ->
         {error, timeout}
     end.
 
-% Token estimation (approximate: ~4 chars per token for English, ~6 for code)
+%% Token estimation using character-based heuristics
+%% For English text: ~4 chars/token (word-based tokenizers)
+%% For code: ~2.5-3 chars/token (code is more dense)
+%% We use a weighted approach based on content type
+count_tokens(Text) when is_binary(Text), byte_size(Text) == 0 ->
+    0;
 count_tokens(Text) when is_binary(Text) ->
-    % Rough estimate: divide by 4 for English, 6 for code
-    max(1, byte_size(Text) div 4);
+    %% Detect content type and apply appropriate ratio
+    %% Code tends to have more symbols, shorter identifiers
+    CodeRatio = estimate_code_ratio(Text),
+    %% Code: ~2.5 chars/token, English: ~4 chars/token
+    EffectiveRatio = 2.5 + (1.5 * (1 - CodeRatio)),
+    max(1, round(byte_size(Text) / EffectiveRatio));
 count_tokens(Text) when is_list(Text) ->
     try
         count_tokens(iolist_to_binary(Text))
     catch
-        _:_ -> max(1, length(Text) div 4)  % Fallback estimate
+        _:_ -> max(1, length(Text) div 3)  % Fallback estimate
     end;
 count_tokens(Messages) when is_list(Messages) ->
     lists:foldl(fun(Msg, Acc) ->
@@ -274,6 +325,111 @@ count_tokens(Messages) when is_list(Messages) ->
             _:_ -> Acc + 10
         end
     end, 0, Messages).
+
+%% Estimate how much of the text is code vs natural language
+%% Returns a value between 0 (pure English) and 1 (pure code)
+estimate_code_ratio(Text) when is_binary(Text) ->
+    Size = byte_size(Text),
+    if Size == 0 -> 0.0; true ->
+        %% Count code-like patterns
+        %% Code has: more brackets, semicolons, equals signs, etc.
+        BracketCount = binary:matches(Text, [<<"{">>, <<"}">>, <<"[">>, <<"]">>, <<"(">>, <<")">>]),
+        SemicolonCount = binary:matches(Text, <<";">>),
+        EqualsCount = binary:matches(Text, <<"=">>),
+        DotCount = binary:matches(Text, <<".">>),
+        ArrowCount = binary:matches(Text, [<<"->">>, <<"=>">>, <<"::">>]),
+        
+        %% Total code indicators
+        CodeIndicators = length(BracketCount) + length(SemicolonCount) + 
+                        length(EqualsCount) + length(ArrowCount),
+        
+        %% Natural text has more dots and longer text
+        NaturalIndicators = length(DotCount),
+        
+        %% Ratio based on density of code patterns
+        %% Code: ~5-10% symbols, English: ~2-3% symbols
+        CodeDensity = min(1.0, CodeIndicators / (Size / 100)),
+        
+        %% Also check for typical code keywords
+        CodeKeywords = binary:matches(Text, [<<"function">>, <<"def ">>, <<"var ">>, 
+                                             <<"const ">>, <<"let ">>, <<"if ">>, 
+                                             <<"else ">>, <<"return ">>, <<"import ">>,
+                                             <<"module ">>, <<"export ">>]),
+        KeywordDensity = min(1.0, length(CodeKeywords) / (Size / 200)),
+        
+        %% Weighted combination
+        (CodeDensity * 0.6 + KeywordDensity * 0.4)
+    end.
+
+%% Accurate token counting using Ollama API
+%% This sends the text to the API and gets actual token count from prompt_eval_count
+%% Caches results to avoid redundant API calls
+count_tokens_accurate(Model, Text) when is_binary(Text) ->
+    CacheKey = {Model, erlang:phash2(Text)},
+    Table = get_token_cache(),
+    
+    %% Check cache first
+    case ets:lookup(Table, CacheKey) of
+        [{_, Count}] -> 
+            {ok, Count};
+        [] ->
+            %% Make API call to get actual token count
+            case get_token_count_from_api(Model, Text) of
+                {ok, Count} ->
+                    %% Cache the result (limit cache size)
+                    CacheSize = ets:info(Table, size),
+                    if CacheSize > ?TOKEN_CACHE_MAX_SIZE ->
+                        ets:delete_all_objects(Table);
+                    true -> ok
+                    end,
+                    ets:insert(Table, {CacheKey, Count}),
+                    {ok, Count};
+                {error, Reason} ->
+                    %% Fall back to estimate on error
+                    {error, Reason, count_tokens(Text)}
+            end
+    end;
+count_tokens_accurate(Model, Text) when is_list(Text) ->
+    count_tokens_accurate(Model, iolist_to_binary(Text));
+count_tokens_accurate(Model, Messages) when is_list(Messages) ->
+    %% For message lists, use estimate since API doesn't directly tokenize messages
+    {ok, count_tokens(Messages)}.
+
+%% Get actual token count by making a minimal API call
+get_token_count_from_api(Model, Text) ->
+    Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
+    Url = Host ++ "/api/generate",
+    
+    %% Use num_predict: 0 to get token count without generating
+    Body = jsx:encode(#{
+        model => Model,
+        prompt => Text,
+        stream => false,
+        options => #{num_predict => 0}
+    }),
+    
+    Headers = [{<<"Content-Type">>, <<"application/json">>}],
+    
+    case hackney:post(Url, Headers, Body, [{recv_timeout, 10000}, with_body]) of
+        {ok, 200, _RespHeaders, RespBody} ->
+            try jsx:decode(RespBody, [return_maps]) of
+                Resp ->
+                    %% prompt_eval_count is the actual token count
+                    case Resp of
+                        #{<<"prompt_eval_count">> := Count} when is_integer(Count) ->
+                            {ok, Count};
+                        _ ->
+                            %% Fall back to estimate if API doesn't return count
+                            {error, no_token_count}
+                    end
+            catch
+                _:_ -> {error, parse_error}
+            end;
+        {ok, StatusCode, _RespHeaders, RespBody} ->
+            {error, {http_error, StatusCode, RespBody}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 % Truncate messages to fit within token limit
 truncate_messages(Messages, MaxTokens) ->

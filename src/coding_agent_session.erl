@@ -414,24 +414,31 @@ build_file_context(OpenFiles) ->
         end
     end, <<>>, OpenFiles).
 
-run_agent_loop(Model, Messages, Iteration, OpenFiles) when Iteration >= ?MAX_ITERATIONS ->
-    {error, max_iterations_reached, Messages};
+%% Token counting now uses API-provided counts when available
 run_agent_loop(Model, Messages, Iteration, OpenFiles) when Iteration >= ?MAX_ITERATIONS ->
     {error, max_iterations_reached, Messages};
 run_agent_loop(Model, Messages, Iteration, OpenFiles) ->
     Tools = coding_agent_tools:tools(),
     case coding_agent_ollama:chat_with_tools(Model, Messages, Tools) of
-        {ok, #{<<"message">> := ResponseMsg}} ->
-            handle_response(Model, Messages, ResponseMsg, Iteration, OpenFiles);
+        {ok, #{<<"message">> := ResponseMsg} = Response} ->
+            %% Extract actual token count from API response if available
+            TokenInfo = maps:get(token_info, Response, #{}),
+            PromptTokens = maps:get(prompt_tokens, TokenInfo, undefined),
+            CompletionTokens = maps:get(completion_tokens, TokenInfo, undefined),
+            ActualTokens = case {PromptTokens, CompletionTokens} of
+                {P, C} when is_integer(P), is_integer(C) -> P + C;
+                _ -> coding_agent_ollama:count_tokens(Messages)  % Fallback to estimate
+            end,
+            handle_response(Model, Messages, ResponseMsg, Iteration, OpenFiles, ActualTokens);
         {error, Reason} ->
             {error, Reason}
     end.
 
-handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles) ->
+handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles, TokensUsed) ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     AssistantMsg = #{
         <<"role">> => <<"assistant">>,
-        <<"content">> => maps:get(<<"content">>, ResponseMsg, <<"">>),
+        <<"content">> => maps:get(<<"content">>, ResponseMsg, <<>>),
         <<"tool_calls">> => ToolCalls
     },
     UpdatedMessages = Messages ++ [AssistantMsg],
@@ -439,41 +446,28 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
     ToolMsg = #{<<"role">> => <<"tool">>, <<"content">> => ToolResults},
     MessagesWithResults = UpdatedMessages ++ [ToolMsg],
     
-    MsgSize = estimate_message_size(MessagesWithResults),
+    %% Estimate tokens for tool results (not included in API response)
+    ToolResultTokens = coding_agent_ollama:count_tokens(ToolResults),
     
     case run_agent_loop(Model, MessagesWithResults, Iteration + 1, NewOpenFiles) of
-        {ok, Response, NewThinking, NewHistory, FinalOpenFiles, TokensUsed} ->
+        {ok, Response, NewThinking, NewHistory, FinalOpenFiles, MoreTokens} ->
             CombinedThinking = case Thinking of
                 <<>> -> NewThinking;
                 _ -> <<Thinking/binary, "\n\n", NewThinking/binary>>
             end,
-            {ok, Response, CombinedThinking, NewHistory, FinalOpenFiles, TokensUsed + MsgSize};
+            {ok, Response, CombinedThinking, NewHistory, FinalOpenFiles, TokensUsed + MoreTokens + ToolResultTokens};
         {error, Reason} ->
             {error, Reason}
     end;
 
-handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles) when Content =/= <<>>, Content =/= nil ->
+handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles, TokensUsed) when Content =/= <<>>, Content =/= nil ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     AssistantMsg = #{<<"role">> => <<"assistant">>, <<"content">> => Content},
     NewHistory = Messages ++ [AssistantMsg],
-    MsgSize = estimate_message_size(NewHistory),
-    {ok, Content, Thinking, NewHistory, OpenFiles, MsgSize};
+    {ok, Content, Thinking, NewHistory, OpenFiles, TokensUsed};
 
-handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles) ->
+handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles, _TokensUsed) ->
     {error, unexpected_response}.
-
-estimate_message_size(Messages) ->
-    lists:foldl(fun(Msg, Acc) ->
-        Content = maps:get(<<"content">>, Msg, <<"">>),
-        Acc + safe_byte_size(Content)
-    end, 0, Messages).
-
-safe_byte_size(Bin) when is_binary(Bin) -> byte_size(Bin);
-safe_byte_size(List) when is_list(List) ->
-    try erlang:iolist_size(List)
-    catch _:_ -> length(List)
-    end;
-safe_byte_size(_) -> 0.
 
 execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
     Results = [execute_single_tool_with_retry(TC, OpenFiles) || TC <- ToolCalls],
