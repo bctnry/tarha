@@ -261,12 +261,12 @@ process_command(_SessionId, History, "models" ++ Rest) when Rest =:= []; hd(Rest
         {ok, Models} when is_list(Models) ->
             CurrentModel = get_model(),
             lists:foreach(fun(Model) ->
-                Name = maps:get(<<"name">>, Model, <<"unknown">>),
-                NameStr = binary_to_list(Name),
-                Size = maps:get(<<"size">>, Model, 0),
+                Name = maps:get(name, Model, <<"unknown">>),
+                NameStr = case is_binary(Name) of true -> binary_to_list(Name); false -> Name end,
+                Size = maps:get(size, Model, 0),
                 SizeMB = case is_integer(Size) of true -> Size div (1024 * 1024); false -> 0 end,
                 Marker = case lists:prefix(CurrentModel, NameStr) of true -> " *"; false -> "" end,
-                io:format("  ~s (~p MB)~s~n", [Name, SizeMB, Marker])
+                io:format("  ~s (~p MB)~s~n", [NameStr, SizeMB, Marker])
             end, Models),
             io:format("~n~p model(s) found.~n~n", [length(Models)]);
         {error, Reason} ->
