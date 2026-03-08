@@ -975,15 +975,30 @@ find_function_clause(Content, F, Arity) ->
 find_function_clause([], _F, _Arity, _Line) ->
     {error, not_found};
 find_function_clause([Line | Rest], F, Arity, LineNum) ->
-    case binary:match(Line, <<F/binary, "(">>) of
+    % Strip leading whitespace to handle indented functions
+    StrippedLine = binary:replace(Line, <<" ">>, <<>>, [global, {leading}]),
+    StrippedLine2 = binary:replace(StrippedLine, <<"\t">>, <<>>, [global, {leading}]),
+    
+    % Match function name at start of stripped line
+    case binary:match(StrippedLine2, <<F/binary, "(">>) of
         {0, _} ->
-            % Count arguments
+            % Found function definition - check arity
             case count_args(Line, Arity) of
                 true -> {ok, LineNum, LineNum + 1};
                 false -> find_function_clause(Rest, F, Arity, LineNum + 1)
             end;
         _ ->
             find_function_clause(Rest, F, Arity, LineNum + 1)
+    end.
+
+is_valid_func_start(<<>>) -> true;
+is_valid_func_start(Before) ->
+    case binary:last(Before) of
+        $\s -> true;
+        $\t -> true;
+        $\n -> true;
+        $- -> true;
+        _ -> false
     end.
 
 count_args(Line, Arity) ->

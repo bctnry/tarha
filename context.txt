@@ -1,0 +1,30 @@
+Session: 8d59f026-32207317-2f9ba717
+Timestamp: 1772946828320
+
+=== Memory Status ===
+Total: 35618 KB, Processes: 94
+
+=== Conversation History ===
+No history
+
+=== Loaded Modules ===
+loaded: coding_agent_app
+loaded: coding_agent_sup
+loaded: coding_agent_ollama
+unloaded: coding_agent_tools
+loaded: coding_agent
+loaded: coding_agent_session_sup
+loaded: coding_agent_session
+unloaded: coding_agent_stream
+unloaded: coding_agent_lsp
+unloaded: coding_agent_index
+loaded: coding_agent_self
+loaded: coding_agent_healer
+loaded: coding_agent_process_monitor
+loaded: coding_agent_conv_memory
+loaded: coding_agent_skills
+unloaded: coding_agent_http
+loaded: coding_agent_repl
+
+=== Recent Crashes ===
+No crashes
