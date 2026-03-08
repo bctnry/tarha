@@ -1151,7 +1151,8 @@ format_modules_text(Modules) ->
     lists:map(fun(M) ->
         Name = maps:get(name, M, unknown),
         Loaded = maps:get(loaded, M, false),
-        io_lib:format("~s ~p\n", [case Loaded of true -> "✓"; false -> "✗" end, Name])
+        Status = case Loaded of true -> "loaded"; false -> "unloaded" end,
+        io_lib:format("~s: ~p~n", [Status, Name])
     end, Modules).
 
 format_crashes_text([]) ->
