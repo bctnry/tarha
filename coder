@@ -88,7 +88,65 @@ fi
 export OLLAMA_MODEL="$MODEL"
 export OLLAMA_HOST="$HOST"
 
-# Start REPL with stdin support
+# Start REPL with stdin support and crash capture
 cd "$SCRIPT_DIR"
-exec erl -noshell -pa "$BUILD_DIR"/*/ebin \
-    -eval "application:set_env(coding_agent, model, \"$MODEL\"), application:set_env(coding_agent, ollama_host, \"$HOST\"), application:ensure_all_started(coding_agent), coding_agent_repl:start(), halt()."
+
+# Create crash reports directory
+mkdir -p "$SCRIPT_DIR/.coding_agent_reports"
+mkdir -p "$SCRIPT_DIR/.tarha/reports"
+
+# Temporary file for crash output
+CRASH_LOG=$(mktemp 2>/dev/null || echo "/tmp/coder-crash-$$.log")
+trap 'rm -f "$CRASH_LOG" 2>/dev/null' EXIT INT TERM
+
+# Run Erlang and capture output
+set +e
+erl -noshell -pa "$BUILD_DIR"/*/ebin \
+    -eval "application:set_env(coding_agent, model, \"$MODEL\"), application:set_env(coding_agent, ollama_host, \"$HOST\"), application:ensure_all_started(coding_agent), coding_agent_repl:start(), halt()." \
+    2>&1 | tee "$CRASH_LOG"
+EXIT_CODE=${PIPESTATUS[0]:-$?}
+set -e
+
+# Check if crash occurred (look for crash patterns in output)
+if [ $EXIT_CODE -ne 0 ] || grep -qE "(Crash|Error|error:|EXIT|undef|case_clause|badarg)" "$CRASH_LOG" 2>/dev/null; then
+    # Generate crash ID
+    CRASH_ID=$(date +%s | sha256sum 2>/dev/null | head -c 16 || echo "boot-$(date +%s)")
+    
+    # Determine report location (prefer .tarha/reports for consistency with healer)
+    CRASH_FILE="$SCRIPT_DIR/.tarha/reports/crash-${CRASH_ID}.md"
+    
+    cat > "$CRASH_FILE" << EOF
+# Boot-Time Crash Report
+
+**Crash ID:** crash-${CRASH_ID}
+
+**Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+**Module:** boot
+
+**Error Type:** boot_crash
+
+**Error:**
+
+\`\`\`
+$(head -100 "$CRASH_LOG")
+\`\`\`
+
+## Suggestion
+
+This crash occurred during application startup, before the healer could catch it.
+
+**Common causes:**
+1. Merge conflicts not resolved (look for `<<<<<<<` or `=======` in source files)
+2. Undefined function (module not compiled or exported)
+3. Syntax error in source files
+
+**Fix:** Run \`rebar3 compile\` and fix any errors shown.
+EOF
+    
+    echo ""
+    echo "✗ Boot crash saved to: $CRASH_FILE"
+    echo "  Run 'cat $CRASH_FILE' to view details"
+fi
+
+exit $EXIT_CODE
