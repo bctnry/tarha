@@ -4,9 +4,9 @@
 -export([count_tokens/1, count_tokens_accurate/2, truncate_messages/2]).
 -export([start_token_cache/0, clear_token_cache/0]).
 -export([get_model_info/1, get_model_context_length/1, get_model_context_length/2]).
--export([show_model/2]).
+-export([show_model/2, get_model_capabilities/1]).
 -export([list_models/0, switch_model/1, get_current_model/0]).
--export([get_token_stats/0]).
+-export([get_token_stats/0, model_supports_thinking/1, model_supports_tools/1]).
 
 -define(MAX_RETRIES, 20).
 -define(RETRY_DELAY_BASE, 5000).  % 5 second base.
@@ -778,23 +778,50 @@ collect_chat_stream_cancellable(SessionId, Callback, ResponseAcc, ThinkingAcc, C
     end.
 
 %% @doc Check if model supports thinking mode
-%% Cloud models and some local models support extended thinking
+%% Queries the model's capabilities from Ollama API
 model_supports_thinking(Model) when is_binary(Model) ->
-    ModelStr = binary_to_list(Model),
-    % Cloud models typically support thinking
-    CloudPatterns = [<<"cloud">>, <<"glm-5">>, <<"glm-4.7">>, <<"qwen3.5">>, <<"qwen3">>, <<"deepseek">>],
-    lists:any(fun(Pattern) -> binary:match(Model, Pattern) =/= nomatch end, CloudPatterns);
+    case get_model_capabilities(Model) of
+        {ok, Capabilities} ->
+            lists:member(<<"thinking">>, Capabilities);
+        {error, _} ->
+            false
+    end;
 model_supports_thinking(Model) when is_list(Model) ->
     model_supports_thinking(list_to_binary(Model));
 model_supports_thinking(_) ->
     false.
 
 %% @doc Check if model supports tool calling
-%% Cloud models and some local models support tools
+%% Queries the model's capabilities from Ollama API
 model_supports_tools(Model) when is_binary(Model) ->
-    CloudPatterns = [<<"cloud">>, <<"glm-5">>, <<"glm-4.7">>, <<"qwen3.5">>, <<"qwen3">>, <<"deepseek">>, <<"gpt">>],
-    lists:any(fun(Pattern) -> binary:match(Model, Pattern) =/= nomatch end, CloudPatterns);
+    case get_model_capabilities(Model) of
+        {ok, Capabilities} ->
+            lists:member(<<"tools">>, Capabilities);
+        {error, _} ->
+            false
+    end;
 model_supports_tools(Model) when is_list(Model) ->
     model_supports_tools(list_to_binary(Model));
 model_supports_tools(_) ->
     false.
+
+%% @doc Get model capabilities from Ollama API
+get_model_capabilities(Model) when is_binary(Model) ->
+    Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
+    Url = Host ++ "/api/show",
+    Body = jsx:encode(#{name => Model}),
+    Headers = [{<<"Content-Type">>, <<"application/json">>}],
+    case hackney:post(Url, Headers, Body, [{recv_timeout, 5000}, with_body]) of
+        {ok, 200, _RespHeaders, RespBody} ->
+            try jsx:decode(RespBody, [return_maps]) of
+                Resp -> 
+                    Capabilities = maps:get(<<"capabilities">>, Resp, []),
+                    {ok, Capabilities}
+            catch
+                _:_ -> {error, parse_error}
+            end;
+        {ok, StatusCode, _RespHeaders, RespBody} ->
+            {error, {http_error, StatusCode, RespBody}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
