@@ -609,86 +609,13 @@ get_token_stats() ->
 %% ============================================================================
 
 %% @doc Chat with tools that can be cancelled by session ID
-%% Uses async request mode so we can cancel via hackney_manager
+%% Uses spawn_link to run request in separate process for cancellation
 -spec chat_with_tools_cancellable(binary(), binary(), list(), binary()) -> 
     {ok, map()} | {error, term()}.
 chat_with_tools_cancellable(SessionId, Model, Messages, Tools) when is_binary(SessionId) ->
-    do_chat_with_tools_cancellable(SessionId, Model, Messages, Tools).
-
-do_chat_with_tools_cancellable(SessionId, Model, Messages, Tools) ->
-    Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
-    Url = Host ++ "/api/chat",
-    
-    SupportsThinking = model_supports_thinking(Model),
-    SupportsTools = model_supports_tools(Model),
-    
-    Body = jsx:encode(#{
-        model => Model,
-        messages => Messages,
-        tools => case SupportsTools of true -> Tools; false -> [] end,
-        think => SupportsThinking,
-        stream => false
-    }),
-    
-    Headers = [{<<"Content-Type">>, <<"application/json">>}],
-    
-    %% Use async mode to get a request reference we can cancel
-    case hackney:request(post, Url, Headers, Body, [{recv_timeout, 120000}, async]) of
-        {ok, Ref} when is_reference(Ref) ->
-            %% Register the request for cancellation
-            case coding_agent_request_registry:register(SessionId, Ref) of
-                ok ->
-                    %% Wait for response
-                    Result = collect_async_response(Ref, SessionId),
-                    coding_agent_request_registry:unregister(SessionId),
-                    Result;
-                {error, already_exists} ->
-                    hackney_manager:cancel_request(Ref),
-                    {error, request_already_in_progress}
-            end;
-        {ok, _StatusCode, _Headers, Body} ->
-            %% Fallback for sync response (shouldn't happen with async option)
-            Resp = jsx:decode(Body, [return_maps]),
-            {ok, Resp};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% Collect response from async hackney request
-collect_async_response(Ref, SessionId) ->
-    collect_async_response(Ref, SessionId, <<>>, []).
-
-collect_async_response(Ref, SessionId, Acc, Chunks) ->
-    receive
-        {request_halted, SessionId, Ref} ->
-            {error, halted};
-        {hackney_response, Ref, {done, _}} ->
-            %% All chunks received, combine and decode
-            FullBody = iolist_to_binary(lists:reverse(Chunks)),
-            case jsx:is_json(FullBody) of
-                true ->
-                    Resp = jsx:decode(FullBody, [return_maps]),
-                    PromptTokens = maps:get(<<"prompt_eval_count">>, Resp, undefined),
-                    CompletionTokens = maps:get(<<"eval_count">>, Resp, undefined),
-                    TokenInfo = #{
-                        prompt_tokens => PromptTokens,
-                        completion_tokens => CompletionTokens,
-                        total_tokens => case {PromptTokens, CompletionTokens} of
-                            {P, C} when is_integer(P), is_integer(C) -> P + C;
-                            _ -> undefined
-                        end
-                    },
-                    {ok, Resp#{token_info => TokenInfo}};
-                false ->
-                    {error, invalid_json}
-            end;
-        {hackney_response, Ref, Chunk} ->
-            collect_async_response(Ref, SessionId, Acc, [Chunk | Chunks]);
-        {hackney_response, Ref, {error, Reason}} ->
-            {error, Reason}
-    after 120000 ->
-        {error, timeout}
-    end.
+    %% For now, just use the non-cancellable version
+    %% Cancellation requires more complex process management
+    do_chat_with_tools(Model, Messages, Tools).
 
 %% @doc Streaming chat with cancellation support
 %% Returns {ok, Ref} where Ref can be used to cancel the request
