@@ -167,7 +167,7 @@ do_chat_with_tools(Model, Messages, Tools) ->
     
     Headers = [{<<"Content-Type">>, <<"application/json">>}],
     
-    case hackney:request(post, Url, Headers, Body, [{recv_timeout, 300000}, with_body]) of
+    case hackney:request(post, Url, Headers, Body, [{recv_timeout, 30000}, with_body]) of
         {ok, 200, _RespHeaders, RespBody} ->
             Resp = jsx:decode(RespBody, [return_maps]),
             %% Extract token counts from response
@@ -286,7 +286,7 @@ collect_chat_stream(Callback, ResponseAcc, ThinkingAcc, ContentAcc) ->
             end;
         _ ->
             collect_chat_stream(Callback, ResponseAcc, ThinkingAcc, ContentAcc)
-    after 300000 ->
+    after 30000 ->
         {error, timeout}
     end.
 
@@ -632,7 +632,7 @@ do_chat_with_tools_cancellable(SessionId, Model, Messages, Tools) ->
     Headers = [{<<"Content-Type">>, <<"application/json">>}],
     
     %% Use async mode to get a request reference we can cancel
-    case hackney:request(post, Url, Headers, Body, [{recv_timeout, 300000}, async]) of
+    case hackney:request(post, Url, Headers, Body, [{recv_timeout, 30000}, async]) of
         {ok, Ref} when is_reference(Ref) ->
             %% Register the request for cancellation
             case coding_agent_request_registry:register(SessionId, Ref) of
@@ -685,7 +685,7 @@ collect_async_response(Ref, SessionId, Acc, Chunks) ->
             collect_async_response(Ref, SessionId, Acc, [Chunk | Chunks]);
         {hackney_response, Ref, {error, Reason}} ->
             {error, Reason}
-    after 300000 ->
+    after 30000 ->
         {error, timeout}
     end.
 
@@ -773,7 +773,7 @@ collect_chat_stream_cancellable(SessionId, Callback, ResponseAcc, ThinkingAcc, C
             end;
         _ ->
             collect_chat_stream_cancellable(SessionId, Callback, ResponseAcc, ThinkingAcc, ContentAcc)
-    after 300000 ->
+    after 30000 ->
         {error, timeout}
     end.
 

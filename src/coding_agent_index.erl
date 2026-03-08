@@ -51,7 +51,7 @@ clear(Pid) ->
     gen_server:call(Pid, clear).
 
 rebuild(Pid) ->
-    gen_server:call(Pid, rebuild, 300000).
+    gen_server:call(Pid, rebuild, 30000).
 
 init([ProjectRoot]) ->
     process_flag(trap_exit, true),

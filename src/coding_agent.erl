@@ -30,7 +30,7 @@ run(Task) ->
     run(Task, #{}).
 
 run(Task, Opts) ->
-    gen_server:call(?MODULE, {run, Task, Opts}, 300000).
+    gen_server:call(?MODULE, {run, Task, Opts}, 30000).
 
 stop() ->
     gen_server:stop(?MODULE).

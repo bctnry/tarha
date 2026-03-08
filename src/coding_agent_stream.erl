@@ -21,7 +21,7 @@ stream(Pid, Messages, Tools) ->
     stream(Pid, Messages, Tools, fun(_, _) -> ok end).
 
 stream(Pid, Messages, Tools, Callback) when is_function(Callback, 2) ->
-    gen_server:call(Pid, {stream, Messages, Tools, Callback}, 300000).
+    gen_server:call(Pid, {stream, Messages, Tools, Callback}, 30000).
 
 cancel(Pid) ->
     gen_server:cast(Pid, cancel).
@@ -48,7 +48,7 @@ handle_call({stream, Messages, Tools, Callback}, _From, State = #state{model = M
                 buffer = <<>>,
                 thinking_buffer = <<>>,
                 cancelled = false
-            }, 300000};
+            }, 30000};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;

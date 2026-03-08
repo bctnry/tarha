@@ -145,7 +145,7 @@ ask_stream(Session, Message, Callback) ->
 ask_stream({Id, Pid}, Message, Callback, Opts) when is_binary(Id), is_pid(Pid) ->
     ask_stream(Pid, Message, Callback, Opts);
 ask_stream(Session, Message, Callback, Opts) when is_pid(Session) ->
-    gen_server:call(Session, {ask_stream, Message, Callback, Opts}, 300000);
+    gen_server:call(Session, {ask_stream, Message, Callback, Opts}, 30000);
 ask_stream(Session, Message, Callback, Opts) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> ask_stream(Pid, Message, Callback, Opts);
@@ -157,7 +157,7 @@ ask_stream(Session, Message, Callback, Opts) when is_list(Session) ->
 ask({Id, Pid}, Message, Opts) when is_binary(Id), is_pid(Pid) ->
     ask(Pid, Message, Opts);
 ask(Session, Message, Opts) when is_pid(Session) ->
-    gen_server:call(Session, {ask, Message, Opts}, 300000);
+    gen_server:call(Session, {ask, Message, Opts}, 30000);
 ask(Session, Message, Opts) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> ask(Pid, Message, Opts);
