@@ -3,16 +3,22 @@
 %%% 
 %%% This module tracks active HTTP requests to the Ollama API and allows
 %%% them to be cancelled/halted. Each session can have one active request.
+%%% 
+%%% Additionally, it tracks cancellation flags for stopping long-running
+%%% tool call chains. A session's agent loop will check this flag before
+%%% each iteration and stop if cancelled.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(coding_agent_request_registry).
 -behaviour(gen_server).
 
 -export([start_link/0, register/2, unregister/1, get_request/1, halt/1, halt_all/0, get_active/0]).
+-export([set_cancelling/1, clear_cancelling/1, is_cancelling/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(TABLE, coding_agent_active_requests).
+-define(CANCEL_TABLE, coding_agent_cancellation_flags).
 
 -record(state, {}).
 
@@ -24,7 +30,9 @@ start_link() ->
 %% Returns ok if registered, {error, already_exists} if session already has a request
 -spec register(binary(), reference()) -> ok | {error, term()}.
 register(SessionId, RequestRef) when is_binary(SessionId), is_reference(RequestRef) ->
-    gen_server:call(?SERVER, {register, SessionId, RequestRef}).
+    %% Get the actual calling process pid
+    CallerPid = self(),
+    gen_server:call(?SERVER, {register, SessionId, RequestRef, CallerPid}).
 
 %% @doc Unregister a request (called when request completes)
 -spec unregister(binary()) -> ok.
@@ -54,15 +62,34 @@ halt_all() ->
 get_active() ->
     gen_server:call(?SERVER, get_active).
 
+%% @doc Set the cancellation flag for a session's agent loop
+%% This tells the agent loop to stop after completing current tool execution
+-spec set_cancelling(binary()) -> ok.
+set_cancelling(SessionId) when is_binary(SessionId) ->
+    gen_server:call(?SERVER, {set_cancelling, SessionId}).
+
+%% @doc Clear the cancellation flag for a session (called when loop exits)
+-spec clear_cancelling(binary()) -> ok.
+clear_cancelling(SessionId) when is_binary(SessionId) ->
+    gen_server:cast(?SERVER, {clear_cancelling, SessionId}).
+
+%% @doc Check if a session's agent loop should stop
+-spec is_cancelling(binary()) -> boolean().
+is_cancelling(SessionId) when is_binary(SessionId) ->
+    case ets:lookup(?CANCEL_TABLE, SessionId) of
+        [{_, true}] -> true;
+        _ -> false
+    end.
+
 %% Gen server callbacks
 
 init([]) ->
     ets:new(?TABLE, [named_table, public, set]),
+    ets:new(?CANCEL_TABLE, [named_table, public, set]),
     {ok, #state{}}.
 
-handle_call({register, SessionId, RequestRef}, _From, State) ->
+handle_call({register, SessionId, RequestRef, CallerPid}, _From, State) ->
     %% Store the request with the caller's pid for notification
-    CallerPid = self(),  % This is the session process
     case ets:lookup(?TABLE, SessionId) of
         [] ->
             ets:insert(?TABLE, {SessionId, RequestRef, CallerPid}),

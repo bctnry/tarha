@@ -459,54 +459,36 @@ truncate_messages([Msg | Rest], MaxTokens, Acc) ->
 
 %% Model info functions - get context length from Ollama API
 
-<<<<<<< HEAD
 -define(DEFAULT_CONTEXT_LENGTH, 32768).
-=======
--define(DEFAULT_CONTEXT_LENGTH, 8192).
->>>>>>> 8aa6c7f057aad1e86beb25e3b84225dc95d5d9e7
 
 get_model_context_length(Model) ->
     get_model_context_length(Model, ?DEFAULT_CONTEXT_LENGTH).
 
 get_model_context_length(Model, Default) when is_binary(Model) ->
     case get_model_info(Model) of
-<<<<<<< HEAD
         {ok, ModelInfo} when is_map(ModelInfo) ->
             extract_context_length_from_model_info(ModelInfo, Default);
-=======
-        {ok, #{<<"parameters">> := Params}} when is_map(Params) ->
-            case extract_context_length(Params) of
-                undefined -> Default;
-                Len when is_integer(Len), Len > 0 -> Len;
-                _ -> Default
-            end;
->>>>>>> 8aa6c7f057aad1e86beb25e3b84225dc95d5d9e7
         _ ->
             Default
     end;
 get_model_context_length(Model, Default) when is_list(Model) ->
     get_model_context_length(list_to_binary(Model), Default).
 
-<<<<<<< HEAD
 extract_context_length_from_model_info(ModelInfo, Default) ->
     Keys = [<<"context_length">>, <<"num_ctx">>, <<"n_ctx">>],
     
-    % Check top level
     TopLevel = find_first_key(ModelInfo, Keys),
     
-    % Check model_info field (nested)
     NestedModelInfo = case maps:get(<<"model_info">>, ModelInfo, undefined) of
         MI when is_map(MI) -> find_first_key(MI, Keys);
         _ -> undefined
     end,
     
-    % Check parameters field
     ParamsCtx = case maps:get(<<"parameters">>, ModelInfo, undefined) of
         P when is_map(P) -> find_first_key(P, Keys);
         _ -> undefined
     end,
     
-    % Check details field
     DetailsCtx = case maps:get(<<"details">>, ModelInfo, undefined) of
         D when is_map(D) -> find_first_key(D, Keys);
         _ -> undefined
@@ -537,13 +519,10 @@ find_first([]) ->
 get_model_info(Model) ->
     show_model(Model, #{}).
 
-%% Show model details with options (supports verbose mode)
 show_model(Model, Opts) when is_binary(Model), is_map(Opts) ->
     Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
     Url = Host ++ "/api/show",
-    %% Build request body - use 'model' parameter as per Ollama API spec
     Body0 = #{model => Model},
-    %% Add verbose option if specified
     Body = case maps:get(<<"verbose">>, Opts, undefined) of
         true -> Body0#{verbose => true};
         _ -> Body0
@@ -551,23 +530,6 @@ show_model(Model, Opts) when is_binary(Model), is_map(Opts) ->
     EncodedBody = jsx:encode(Body),
     Headers = [{<<"Content-Type">>, <<"application/json">>}],
     case hackney:post(Url, Headers, EncodedBody, [{recv_timeout, 10000}, with_body]) of
-=======
-extract_context_length(Params) when is_map(Params) ->
-    Keys = [<<"context_length">>, <<"num_ctx">>, <<"n_ctx">>],
-    lists:foldl(fun(Key, Acc) ->
-        case Acc of
-            undefined -> maps:get(Key, Params, undefined);
-            _ -> Acc
-        end
-    end, undefined, Keys).
-
-get_model_info(Model) when is_binary(Model) ->
-    Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
-    Url = Host ++ "/api/show",
-    Body = jsx:encode(#{name => Model}),
-    Headers = [{<<"Content-Type">>, <<"application/json">>}],
-    case hackney:post(Url, Headers, Body, [{recv_timeout, 10000}, with_body]) of
->>>>>>> 8aa6c7f057aad1e86beb25e3b84225dc95d5d9e7
         {ok, 200, _RespHeaders, RespBody} ->
             try jsx:decode(RespBody, [return_maps]) of
                 Resp -> {ok, Resp}
@@ -579,13 +541,11 @@ get_model_info(Model) when is_binary(Model) ->
         {error, Reason} ->
             {error, Reason}
     end;
-<<<<<<< HEAD
 show_model(Model, Opts) when is_list(Model) ->
     show_model(list_to_binary(Model), Opts).
 
 %% Model management functions
 
-%% List all available models from Ollama API
 list_models() ->
     Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
     Url = Host ++ "/api/tags",
@@ -594,7 +554,6 @@ list_models() ->
         {ok, 200, _RespHeaders, RespBody} ->
             try jsx:decode(RespBody, [return_maps]) of
                 #{<<"models">> := Models} ->
-                    %% Extract relevant model info
                     ModelList = lists:map(fun(#{<<"name">> := Name} = M) ->
                         #{
                             name => Name,
@@ -616,7 +575,6 @@ list_models() ->
             {error, Reason}
     end.
 
-%% Switch the current model by updating application environment
 switch_model(Model) when is_binary(Model) ->
     OldModel = get_current_model(),
     application:set_env(coding_agent, ollama_model, binary_to_list(Model)),
@@ -624,7 +582,6 @@ switch_model(Model) when is_binary(Model) ->
 switch_model(Model) when is_list(Model) ->
     switch_model(list_to_binary(Model)).
 
-%% Get the current model from application environment
 get_current_model() ->
     case application:get_env(coding_agent, ollama_model) of
         {ok, Model} when is_list(Model) -> list_to_binary(Model);
@@ -641,13 +598,40 @@ get_token_stats() ->
 %% ============================================================================
 
 %% @doc Chat with tools that can be cancelled by session ID
-%% For now, uses the synchronous version since async streaming had issues
+%% Spawns a worker process to allow cancellation via halt/1
 -spec chat_with_tools_cancellable(binary(), binary(), list(), list()) -> 
     {ok, map()} | {error, term()}.
 chat_with_tools_cancellable(SessionId, Model, Messages, Tools) when is_binary(SessionId) ->
-    %% Use the working synchronous version
-    %% TODO: Implement proper async cancellation later
-    do_chat_with_tools(Model, Messages, Tools).
+    Parent = self(),
+    Ref = make_ref(),
+    
+    %% Spawn worker process for the request
+    WorkerPid = spawn_link(fun() ->
+        Result = do_chat_with_tools(Model, Messages, Tools),
+        Parent ! {chat_result, Ref, Result}
+    end),
+    
+    %% Register for cancellation
+    case coding_agent_request_registry:register(SessionId, Ref) of
+        ok ->
+            %% Wait for result or cancellation
+            Result = receive
+                {chat_result, Ref, R} ->
+                    R;
+                {request_halted, SessionId, _} ->
+                    unlink(WorkerPid),
+                    exit(WorkerPid, kill),
+                    {error, halted}
+            after 300000 ->
+                exit(WorkerPid, kill),
+                {error, timeout}
+            end,
+            coding_agent_request_registry:unregister(SessionId),
+            Result;
+        {error, already_exists} ->
+            exit(WorkerPid, kill),
+            {error, request_already_in_progress}
+    end.
 
 %% @doc Streaming chat with cancellation support
 %% Returns {ok, Ref} where Ref can be used to cancel the request
@@ -785,7 +769,3 @@ get_model_capabilities(Model) when is_binary(Model) ->
         {error, Reason} ->
             {error, Reason}
     end.
-=======
-get_model_info(Model) when is_list(Model) ->
-    get_model_info(list_to_binary(Model)).
->>>>>>> 8aa6c7f057aad1e86beb25e3b84225dc95d5d9e7
