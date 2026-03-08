@@ -864,8 +864,8 @@ extract_format_args(Line) ->
             {error, no_io_lib_format}
     end.
 
-find_closing_paren(<<>>, _Depth, Acc) -> error;
-find_closing_paren(<<$), Rest/binary>>, 1, Acc) -> {ok, <<Acc/binary>>};
+find_closing_paren(<<>>, _Depth, _Acc) -> error;
+find_closing_paren(<<$), Rest/binary>>, 1, Acc) -> {ok, Acc};
 find_closing_paren(<<$), Rest/binary>>, Depth, Acc) -> 
     find_closing_paren(Rest, Depth - 1, <<Acc/binary, $)>>);
 find_closing_paren(<<$(, Rest/binary>>, Depth, Acc) -> 
@@ -873,86 +873,193 @@ find_closing_paren(<<$(, Rest/binary>>, Depth, Acc) ->
 find_closing_paren(<<C, Rest/binary>>, Depth, Acc) -> 
     find_closing_paren(Rest, Depth, <<Acc/binary, C>>).
 
-%% Fix badmatch - add catch-all pattern
-fix_badmatch(CrashData) ->
+%% Generic helper: read crash line and apply fix function
+fix_at_crash_line(CrashData, FixFun) ->
     #{stacktrace := Stacktrace} = CrashData,
-    case Stacktrace of
-        [{M, F, A, _Loc} | _] ->
-            SourceFile = find_source_file(M),
-            case file:read_file(SourceFile) of
+    case find_user_code_location(Stacktrace) of
+        {ok, File, LineNum} ->
+            case file:read_file(File) of
                 {ok, Content} ->
-                    case find_function_clause(Content, F, A) of
-                        {ok, ClauseStart, ClauseEnd} ->
-                            % Add catch-all clause
-                            NewContent = add_wildcard_clause(Content, F, A, ClauseEnd),
-                            file:write_file(SourceFile, NewContent),
-                            coding_agent_self:reload_module(M),
-                            {ok, #{file => SourceFile, action => added_wildcard_clause}};
-                        {error, not_found} ->
-                            {error, could_not_locate_function}
+                    Lines = binary:split(Content, <<"\n">>, [global]),
+                    case lists:nth(LineNum, Lines) of
+                        LineContent when is_binary(LineContent) ->
+                            case FixFun(LineContent, LineNum, Lines) of
+                                {ok, NewLines} when is_list(NewLines) ->
+                                    NewContent = iolist_to_binary(lists:join(<<"\n">>, NewLines)),
+                                    file:write_file(File, NewContent),
+                                    Module = filename_to_module(File),
+                                    coding_agent_self:reload_module(Module),
+                                    {ok, #{file => File, line => LineNum, action => fixed}};
+                                {ok, NewLine} when is_binary(NewLine) ->
+                                    {Before, After} = lists:split(LineNum - 1, Lines),
+                                    NewLines = Before ++ [NewLine] ++ After,
+                                    NewContent = iolist_to_binary(lists:join(<<"\n">>, NewLines)),
+                                    file:write_file(File, NewContent),
+                                    Module = filename_to_module(File),
+                                    coding_agent_self:reload_module(Module),
+                                    {ok, #{file => File, line => LineNum, action => fixed}};
+                                {error, Reason} ->
+                                    {error, Reason}
+                            end;
+                        _ ->
+                            {error, cannot_extract_line}
                     end;
                 {error, _} ->
                     {error, cannot_read_source}
             end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Fix badmatch - read crash line and fix pattern match
+fix_badmatch(CrashData) ->
+    fix_at_crash_line(CrashData, fun fix_badmatch_line/3).
+
+fix_badmatch_line(Line, _LineNum, _Lines) ->
+    case binary:match(Line, <<"=">>) of
+        {Pos, _} when Pos > 0 ->
+            <<Before:Pos/binary, _/binary>> = Line,
+            Pattern = string:trim(Before, trailing),
+            Indent = get_line_indent(Line),
+            case string:find(Pattern, <<"{">>) of
+                nomatch ->
+                    {error, no_tuple_pattern};
+                _ ->
+                    case string:find(Pattern, <<"}">>) of
+                        nomatch ->
+                            {error, incomplete_tuple};
+                        _ ->
+                            Wildcard = <<Indent/binary, Pattern/binary, " = _">>,
+                            {ok, Wildcard}
+                    end
+            end;
         _ ->
-            {error, invalid_stacktrace}
+            {error, no_match_pattern}
+    end.
+
+%% Fix case_clause - add wildcard case
+fix_case_clause(CrashData) ->
+    fix_at_crash_line(CrashData, fun fix_case_clause_line/3).
+
+fix_case_clause_line(Line, LineNum, Lines) ->
+    case string:find(Line, <<"case">>) of
+        nomatch ->
+            case find_enclosing_construct(Lines, LineNum, <<"case">>, <<"end">>) of
+                {ok, CaseStart, CaseEnd} ->
+                    Indent = get_line_indent(Line),
+                    Wildcard = <<Indent/binary, "    _ -> ok">>,
+                    {Before, After} = lists:split(CaseEnd - 1, Lines),
+                    NewLines = Before ++ [Wildcard] ++ After,
+                    {ok, NewLines};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        _ ->
+            Indent = get_line_indent(Line),
+            Wildcard = <<Indent/binary, "    _ -> ok">>,
+            {ok, Wildcard}
     end.
 
 %% Fix if_clause - add true clause
 fix_if_clause(CrashData) ->
-    #{stacktrace := Stacktrace} = CrashData,
-    case Stacktrace of
-        [{M, _F, _A, _Loc} | _] ->
-            SourceFile = find_source_file(M),
-            case file:read_file(SourceFile) of
-                {ok, Content} ->
-                    NewContent = add_if_true_clause(Content),
-                    file:write_file(SourceFile, NewContent),
-                    coding_agent_self:reload_module(M),
-                    {ok, #{file => SourceFile, action => added_if_true_clause}};
-                {error, _} ->
-                    {error, cannot_read_source}
-            end;
-        _ ->
-            {error, invalid_stacktrace}
+    fix_at_crash_line(CrashData, fun fix_if_clause_line/3).
+
+fix_if_clause_line(Line, LineNum, Lines) ->
+    case find_enclosing_construct(Lines, LineNum, <<"if">>, <<"end">>) of
+        {ok, IfStart, IfEnd} ->
+            Indent = get_line_indent(Line),
+            TrueClause = <<Indent/binary, "    true -> ok">>,
+            {Before, After} = lists:split(IfEnd - 1, Lines),
+            NewLines = Before ++ [TrueClause] ++ After,
+            {ok, NewLines};
+        {error, _} ->
+            Indent = get_line_indent(Line),
+            {ok, <<Indent/binary, "true -> ok">>}
     end.
 
 %% Fix try_clause - add catch clause
 fix_try_clause(CrashData) ->
-    #{stacktrace := Stacktrace} = CrashData,
-    case Stacktrace of
-        [{M, _F, _A, _Loc} | _] ->
-            SourceFile = find_source_file(M),
-            case file:read_file(SourceFile) of
-                {ok, Content} ->
-                    NewContent = add_try_catch_clause(Content),
-                    file:write_file(SourceFile, NewContent),
-                    coding_agent_self:reload_module(M),
-                    {ok, #{file => SourceFile, action => added_catch_clause}};
-                {error, _} ->
-                    {error, cannot_read_source}
-            end;
-        _ ->
-            {error, invalid_stacktrace}
+    fix_at_crash_line(CrashData, fun fix_try_clause_line/3).
+
+fix_try_clause_line(Line, LineNum, Lines) ->
+    case find_enclosing_construct(Lines, LineNum, <<"try">>, <<"end">>) of
+        {ok, TryStart, TryEnd} ->
+            Indent = get_line_indent(Line),
+            CatchClause = <<Indent/binary, "catch">>,
+            CatchAll = <<Indent/binary, "    _:_ -> ok">>,
+            {Before, After} = lists:split(TryEnd - 1, Lines),
+            NewLines = Before ++ [CatchClause, CatchAll] ++ After,
+            {ok, NewLines};
+        {error, _} ->
+            {error, no_try_block}
     end.
 
-%% Fix function_clause - add missing function clause
+%% Fix function_clause - add catch-all clause
 fix_function_clause(CrashData) ->
-    #{stacktrace := Stacktrace} = CrashData,
-    case Stacktrace of
-        [{M, F, A, _Loc} | _] ->
-            SourceFile = find_source_file(M),
-            case file:read_file(SourceFile) of
-                {ok, Content} ->
-                    NewContent = add_function_clause(Content, F, A),
-                    file:write_file(SourceFile, NewContent),
-                    coding_agent_self:reload_module(M),
-                    {ok, #{file => SourceFile, action => added_function_clause}};
-                {error, _} ->
-                    {error, cannot_read_source}
-            end;
+    fix_at_crash_line(CrashData, fun fix_function_clause_line/3).
+
+fix_function_clause_line(Line, LineNum, Lines) ->
+    case binary:match(Line, <<"(">>) of
+        {Pos, _} ->
+            <<FuncName:Pos/binary, _/binary>> = Line,
+            Indent = get_line_indent(Line),
+            CatchAll = <<Indent/binary, FuncName/binary, "(_) -> ok">>,
+            {ok, CatchAll};
         _ ->
-            {error, invalid_stacktrace}
+            {error, no_function_name}
+    end.
+
+%% Helper functions
+
+get_line_indent(Line) ->
+    case binary:match(Line, <<"\t">>) of
+        {0, _} ->
+            <<$\t, Rest/binary>> = Line,
+            <<$\t, (get_line_indent(Rest))/binary>>;
+        _ ->
+            case binary:match(Line, <<" ">>) of
+                {0, _} ->
+                    <<$\s, Rest/binary>> = Line,
+                    <<$\s, (get_line_indent(Rest))/binary>>;
+                _ ->
+                    <<>>
+            end
+    end.
+
+find_enclosing_construct(Lines, LineNum, StartKeyword, EndKeyword) ->
+    % Search backwards for start, forwards for end
+    case find_construct_start(Lines, LineNum, StartKeyword) of
+        {ok, StartLine} ->
+            case find_construct_end(Lines, LineNum, EndKeyword) of
+                {ok, EndLine} ->
+                    {ok, StartLine, EndLine};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+find_construct_start(Lines, LineNum, Keyword) when LineNum < 1 ->
+    {error, not_found};
+find_construct_start(Lines, LineNum, Keyword) ->
+    Line = lists:nth(LineNum, Lines),
+    case binary:match(Line, Keyword) of
+        {_, _} ->
+            {ok, LineNum};
+        _ ->
+            find_construct_start(Lines, LineNum - 1, Keyword)
+    end.
+
+find_construct_end(Lines, LineNum, Keyword) when LineNum > length(Lines) ->
+    {error, not_found};
+find_construct_end(Lines, LineNum, Keyword) ->
+    Line = lists:nth(LineNum, Lines),
+    case binary:match(Line, Keyword) of
+        {_, _} ->
+            {ok, LineNum};
+        _ ->
+            find_construct_end(Lines, LineNum + 1, Keyword)
     end.
 
 %% Helper functions for fixes
