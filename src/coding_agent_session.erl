@@ -27,8 +27,30 @@
 -define(CONTEXT_USAGE_THRESHOLD, 2.0).  % Effectively disabled (200%)
 -define(COMPACTION_THRESHOLD, 999999999).  % Effectively disabled
 -define(ARCHIVE_DIR, ".tarha/sessions").
+-define(CRASH_DIR, ".tarha/reports").
 -define(MAX_TOOL_RETRIES, 3).
 -define(SESSIONS_TABLE, coding_agent_sessions).
+
+% Self-healing: When recovering from crash, agent reads crash report and fixes itself
+-define(HEAL_PROMPT, <<"You just recovered from a crash. A crash report has been saved.
+
+## What happened
+You crashed while processing a request. The error, stacktrace, and context have been saved.
+
+## Your task
+Self-healing mode activated. You must fix yourself:
+
+1. Read the crash report shown above using read_file
+2. Analyze the error and stacktrace
+3. Read the source file where the crash occurred using read_file  
+4. Use edit_file to fix the bug
+5. Run 'rebar3 compile' using bash to verify the fix
+6. Report what was fixed
+
+## Important
+- Fix the ACTUAL root cause, don't just add try/catch wrappers
+- The crash report is in .tarha/reports/
+- After fixing, the code will be hot-reloaded automatically">>).
 -define(SYSTEM_PROMPT, <<"You are an autonomous coding assistant. You CAN and SHOULD take multiple actions to complete tasks without asking for permission between steps.
 
 ## Your Capabilities
@@ -292,6 +314,9 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
     % Get AGENTS.md context
     AgentsContext = get_agents_context(),
     
+    % Check for recent crashes (self-healing)
+    CrashContext = get_recent_crash_context(),
+    
     % Build system prompt with all context sections
     ContextParts = [],
     
@@ -317,9 +342,15 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
     end,
     
     % Add open files if present
-    SystemContent = case FileContext of
+    WithFiles = case FileContext of
         <<>> -> WithSkills;
         _ -> <<WithSkills/binary, "\n\nOpen files (cached in context):\n", FileContext/binary>>
+    end,
+    
+    % Add crash report if recent crash detected (self-healing)
+    SystemContent = case CrashContext of
+        <<>> -> WithFiles;
+        _ -> <<WithFiles/binary, "\n\n", ?HEAL_PROMPT/binary, "\n\n", CrashContext/binary>>
     end,
     
     SystemMsg = #{<<"role">> => <<"system">>, <<"content">> => SystemContent},
@@ -740,6 +771,41 @@ trim_history(History, MaxTokens) when is_integer(MaxTokens) ->
                             NewRest = lists:droplast(Rest),
                             Last = lists:last(Rest),
                             trim_history([SysMsg | NewRest] ++ [Last], MaxTokens)
+                    end
+            end
+    end.
+
+%% Self-healing: Check for recent crash reports and include in context
+get_recent_crash_context() ->
+    CrashDir = ?CRASH_DIR,
+    case filelib:is_dir(CrashDir) of
+        false -> <<>>;
+        true ->
+            % Get all crash reports sorted by modification time (newest first)
+            CrashFiles = filelib:wildcard(filename:join(CrashDir, "crash-*.md")),
+            SortedFiles = lists:sort(fun(A, B) ->
+                filelib:last_modified(A) > filelib:last_modified(B)
+            end, CrashFiles),
+            
+            % Get the most recent crash
+            case SortedFiles of
+                [] -> <<>>;
+                [MostRecent | _] ->
+                    % Check if crash is recent (within last 60 seconds)
+                    Mtime = filelib:last_modified(MostRecent),
+                    Now = calendar:local_time(),
+                    SecDiff = calendar:datetime_to_gregorian_seconds(Now) -
+                               calendar:datetime_to_gregorian_seconds(Mtime),
+                    case SecDiff < 60 of
+                        true ->
+                            % Recent crash - include in context
+                            CrashPath = list_to_binary(MostRecent),
+                            <<"\n\n# Recent Crash Detected\n\n"
+                              "A crash occurred within the last 60 seconds.\n\n"
+                              "Crash report: ", CrashPath/binary, "\n\n"
+                              "Use `read_file \"", CrashPath/binary, "\"` to read the full crash report.\n">>;
+                        false ->
+                            <<>>
                     end
             end
     end.
