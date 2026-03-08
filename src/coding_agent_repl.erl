@@ -1,14 +1,26 @@
 -module(coding_agent_repl).
--export([start/0, start/1, loop/2]).
+-export([start/0, start/1, loop/3]).
 -export([rl/0]).
 
+%% Mode: build | plan
+%% In build mode, agent acts normally
+%% In plan mode, agent discusses and refines plans
+
 -define(HISTORY_FILE, ".tarha/history").
+
+%% Plan mode state stored in process dictionary
+-define(MODE_KEY, {coding_agent_repl, mode}).
+-define(PLAN_KEY, {coding_agent_repl, current_plan}).
 
 start() ->
     start([]).
 start(_Args) ->
     try
         application:ensure_all_started(coding_agent),
+        
+        % Initialize mode to build
+        put(?MODE_KEY, build),
+        put(?PLAN_KEY, <<"">>),
         
         io:format("~n"),
         io:format("╔════════════════════════════════════════════════════════════╗~n"),
@@ -30,6 +42,10 @@ start(_Args) ->
         io:format("║   /restore <id>  - Restore from checkpoint                ║~n"),
         io:format("║   /clear         - Clear session history                  ║~n"),
         io:format("║   /trim           - Force memory cleanup                    ║~n"),
+        io:format("║   /plan          - Enter plan mode                        ║~n"),
+        io:format("║   /build         - Exit plan mode, enter build mode       ║~n"),
+        io:format("║   /showplan      - Show current plan                      ║~n"),
+        io:format("║   /editplan      - Edit plan in editor                    ║~n"),
         io:format("║   /quit, /exit   - Exit the REPL                          ║~n"),
         io:format("╚════════════════════════════════════════════════════════════╝~n"),
         io:format("~n"),
@@ -40,7 +56,7 @@ start(_Args) ->
         History = load_history(),
         
         io:format("Type your message and press Enter (/help for commands):~n~n"),
-        loop(SessionId, History),
+        loop(SessionId, History, build),
         ok
     catch
         Type:Error:Stacktrace ->
@@ -64,8 +80,37 @@ flush_pending_output() ->
     io:format("", []),
     ok.
 
-loop(SessionId, History) ->
-    io:format("coder> ", []),
+get_current_mode() ->
+    case get(?MODE_KEY) of
+        undefined -> build;
+        Mode -> Mode
+    end.
+
+set_current_mode(Mode) ->
+    put(?MODE_KEY, Mode).
+
+get_current_plan() ->
+    case get(?PLAN_KEY) of
+        undefined -> <<"">>;
+        Plan -> Plan
+    end.
+
+set_current_plan(Plan) ->
+    put(?PLAN_KEY, Plan).
+
+get_mode_prompt(build) ->
+    "coder> ";
+get_mode_prompt(plan) ->
+    "plan> ".
+
+get_mode_indicator(build) ->
+    "[BUILD]";
+get_mode_indicator(plan) ->
+    "[PLAN]".
+
+loop(SessionId, History, Mode) ->
+    Prompt = get_mode_prompt(Mode),
+    io:format("~s", [Prompt]),
     flush_pending_output(),
     case file:read_line(standard_io) of
         eof ->
@@ -80,13 +125,13 @@ loop(SessionId, History) ->
             Input = sanitize_input(Line),
             case Input of
                 "" -> 
-                    ?MODULE:loop(SessionId, History);
+                    ?MODULE:loop(SessionId, History, Mode);
                 _ -> 
-                    case process_input(SessionId, History, Input) of
-                        {continue, NewHistory} ->
-                            ?MODULE:loop(SessionId, NewHistory);
-                        {new_session, NewSessionId, NewHistory} ->
-                            ?MODULE:loop(NewSessionId, NewHistory);
+                    case process_input(SessionId, History, Input, Mode) of
+                        {continue, NewHistory, NewMode} ->
+                            ?MODULE:loop(SessionId, NewHistory, NewMode);
+                        {new_session, NewSessionId, NewHistory, NewMode} ->
+                            ?MODULE:loop(NewSessionId, NewHistory, NewMode);
                         stop ->
                             ok
                     end
@@ -133,36 +178,36 @@ safe_trim(String) ->
             lists:reverse(lists:dropwhile(fun(C) -> C =:= $\s orelse C =:= $\t orelse C =:= $\n orelse C =:= $\r end, lists:reverse(StrippedFront)))
     end.
 
-process_input(SessionId, History, Input) ->
-    try process_input_impl(SessionId, History, Input) of
+process_input(SessionId, History, Input, Mode) ->
+    try process_input_impl(SessionId, History, Input, Mode) of
         Result -> Result
     catch
         Type:Error:Stacktrace ->
             io:format("~n** Command crashed: ~p:~p~n", [Type, Error]),
             report_crash(Type, Error, Stacktrace, SessionId),
             io:format("~n"),
-            {continue, History}
+            {continue, History, Mode}
     end.
 
-process_input_impl(_SessionId, History, "") ->
-    {continue, History};
-process_input_impl(SessionId, History, Input) when is_list(Input) ->
+process_input_impl(_SessionId, History, "", Mode) ->
+    {continue, History, Mode};
+process_input_impl(SessionId, History, Input, Mode) when is_list(Input) ->
     % Check if it starts with /
     case Input of
         [$/ | Rest] ->
             % It's a command - safely process it
             SafeCmd = safe_trim(Rest),
-            process_command(SessionId, History, SafeCmd);
+            process_command(SessionId, History, SafeCmd, Mode);
         _ ->
             % It's a message to the agent
             SafeInput = safe_trim(Input),
-            process_message(SessionId, History, SafeInput)
+            process_message(SessionId, History, SafeInput, Mode)
     end;
-process_input_impl(SessionId, History, Input) ->
+process_input_impl(SessionId, History, Input, Mode) ->
     % Convert binary to list first
-    process_input_impl(SessionId, History, io_lib:format("~s", [Input])).
+    process_input_impl(SessionId, History, io_lib:format("~s", [Input]), Mode).
 
-process_command(SessionId, History, "help" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~nCommands:~n"),
     io:format("  /help           - Show this help~n"),
     io:format("  /status         - Show session & memory status~n"),
@@ -186,9 +231,16 @@ process_command(SessionId, History, "help" ++ Rest) when Rest =:= []; hd(Rest) =
     io:format("  /reports        - List crash/fix reports~n"),
     io:format("  /fix <id>       - Attempt auto-fix~n"),
     io:format("  /dump <file>   - Dump context to file (.md/.json/.txt)~n"),
-    {continue, History};
+    io:format("  /plan           - Enter plan mode (discuss and refine plans)~n"),
+    io:format("  /build          - Exit plan mode, enter build mode (execute)~n"),
+    io:format("  /showplan       - Show current plan~n"),
+    io:format("  /editplan       - Edit plan in external editor~n"),
+    io:format("  /clearplan      - Clear current plan~n"),
+    io:format("  /quit, /exit    - Exit REPL~n"),
+    io:format("~nCurrent mode: ~s~n", [get_mode_indicator(Mode)]),
+    {continue, History, Mode};
     
-process_command(SessionId, History, "status" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "status" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~nSession Status:~n"),
     try coding_agent_session:stats(SessionId) of
         {ok, Stats} ->
@@ -244,9 +296,20 @@ process_command(SessionId, History, "status" ++ Rest) when Rest =:= []; hd(Rest)
     catch _:_ -> []
     end,
     io:format("  Checkpoints: ~p~n~n", [length(Ckpts)]),
-    {continue, History};
+    io:format("  Current Mode: ~s~n", [get_mode_indicator(Mode)]),
+    CurrentPlan = get_current_plan(),
+    case byte_size(CurrentPlan) of
+        0 -> io:format("  Current Plan: (none)~n~n");
+        _ -> 
+            PlanPreview = case byte_size(CurrentPlan) > 100 of
+                true -> binary:part(CurrentPlan, 0, 100);
+                false -> CurrentPlan
+            end,
+            io:format("  Current Plan: ~s...~n~n", [PlanPreview])
+    end,
+    {continue, History, Mode};
     
-process_command(SessionId, History, "history" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "history" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     {ok, Messages} = coding_agent_session:history(SessionId),
     io:format("~nConversation History:~n"),
     lists:foreach(fun(Msg) ->
@@ -259,9 +322,9 @@ process_command(SessionId, History, "history" ++ Rest) when Rest =:= []; hd(Rest
         io:format("  [~s] ~s~n", [Role, Preview])
     end, Messages),
     io:format("~n"),
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "tools" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "tools" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Tools = coding_agent_tools:tools(),
     io:format("~nAvailable Tools (~p):~n", [length(Tools)]),
     lists:foreach(fun(Tool) ->
@@ -269,9 +332,9 @@ process_command(SessionId, History, "tools" ++ Rest) when Rest =:= []; hd(Rest) 
         io:format("  - ~s~n", [Name])
     end, Tools),
     io:format("~n"),
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(_SessionId, History, "models" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "models" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~nAvailable Ollama Models:~n"),
     case coding_agent_ollama:list_models() of
         {ok, Models} when is_list(Models) ->
@@ -288,9 +351,9 @@ process_command(_SessionId, History, "models" ++ Rest) when Rest =:= []; hd(Rest
         {error, Reason} ->
             io:format("  Error listing models: ~p~n~n", [Reason])
     end,
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(_SessionId, History, "model " ++ ModelName) ->
+process_command(_SessionId, History, "model " ++ ModelName, Mode) ->
     Name = safe_trim(ModelName),
     io:format("~nModel Details for: ~s~n", [Name]),
     case coding_agent_ollama:show_model(Name, #{}) of
@@ -352,13 +415,13 @@ process_command(_SessionId, History, "model " ++ ModelName) ->
             io:format("~n  Context Length: ~p~n", [CtxLen]),
             
             io:format("~n"),
-            {continue, History};
+            {continue, History, Mode};
         {error, Reason} ->
             io:format("  Error getting model info: ~p~n~n", [Reason]),
-            {continue, History}
+            {continue, History, Mode}
     end;
 
-process_command(SessionId, History, "switch " ++ ModelName) ->
+process_command(SessionId, History, "switch " ++ ModelName, Mode) ->
     Name = safe_trim(ModelName),
     io:format("Switching to model: ~s...~n", [Name]),
     case coding_agent_ollama:switch_model(Name) of
@@ -368,9 +431,9 @@ process_command(SessionId, History, "switch " ++ ModelName) ->
         {error, Reason} ->
             io:format("✗ Failed to switch model: ~p~n~n", [Reason])
     end,
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(SessionId, History, "context") ->
+process_command(SessionId, History, "context", Mode) ->
     % Show current context size (no arguments)
     io:format("~nContext Size:~n"),
     try coding_agent_session:get_context_length(SessionId) of
@@ -385,8 +448,8 @@ process_command(SessionId, History, "context") ->
     catch _:Error ->
         io:format("  Error: ~p~n~n", [Error])
     end,
-    {continue, History};
-process_command(SessionId, History, "context " ++ SizeStr) ->
+    {continue, History, Mode};
+process_command(SessionId, History, "context " ++ SizeStr, Mode) ->
     % Set context size
     case string:to_integer(safe_trim(SizeStr)) of
         {Size, []} when Size > 0 ->
@@ -400,9 +463,9 @@ process_command(SessionId, History, "context " ++ SizeStr) ->
         _ ->
             io:format("✗ Invalid size: '~s'. Must be a positive integer.~n~n", [safe_trim(SizeStr)])
     end,
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "modules" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "modules" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Modules = try coding_agent_self:get_modules() of
         L when is_list(L) -> L;
         {ok, L} -> L;
@@ -418,9 +481,9 @@ process_command(SessionId, History, "modules" ++ Rest) when Rest =:= []; hd(Rest
         io:format("  ~p ~s ~s~n", [Name, Status, Path])
     end, Modules),
     io:format("~n"),
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "reload" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "reload" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     case safe_trim(Rest) of
         "" ->
             io:format("Reloading all modules...~n"),
@@ -444,14 +507,14 @@ process_command(SessionId, History, "reload" ++ Rest) when Rest =:= []; hd(Rest)
                 Type:Error:Stack ->
                     io:format("✗ Reload all crashed: ~p:~p~n", [Type, Error]),
                     report_crash(Type, Error, Stack),
-                    {continue, History}
+                    {continue, History, Mode}
             end,
-            {continue, History};
+            {continue, History, Mode};
         ModuleName ->
             ModAtom = try list_to_existing_atom(ModuleName)
             catch error:badarg -> 
                 io:format("Error: Unknown module ~p~n", [ModuleName]),
-                {continue, History}
+                {continue, History, Mode}
             end,
             case ModAtom of
                 _ when is_atom(ModAtom) ->
@@ -467,24 +530,24 @@ process_command(SessionId, History, "reload" ++ Rest) when Rest =:= []; hd(Rest)
                         Type:Error:Stack ->
                             io:format("✗ Reload crashed: ~p:~p~n", [Type, Error]),
                             report_crash(Type, Error, Stack),
-                            {continue, History}
+                            {continue, History, Mode}
                     end,
-                    {continue, History};
+                    {continue, History, Mode};
                 _ ->
-                    {continue, History}
+                    {continue, History, Mode}
             end
     end;
     
-process_command(SessionId, History, "checkpoint" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "checkpoint" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     case coding_agent_self:create_checkpoint() of
         #{success := true, id := Id} ->
             io:format("✓ Checkpoint created: ~s~n~n", [Id]);
         #{success := false, error := Error} ->
             io:format("✗ Failed: ~s~n~n", [Error])
     end,
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "restore " ++ CkptId) ->
+process_command(SessionId, History, "restore " ++ CkptId, Mode) ->
     Id = list_to_binary(safe_trim(CkptId)),
     case coding_agent_self:restore_checkpoint(Id) of
         #{success := true} ->
@@ -492,17 +555,17 @@ process_command(SessionId, History, "restore " ++ CkptId) ->
         #{success := false, error := Error} ->
             io:format("✗ Failed: ~s~n~n", [Error])
     end,
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "clear" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "clear" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     try coding_agent_session:clear(SessionId) of
         _ -> io:format("✓ Session history cleared~n~n")
     catch _:_ ->
         io:format("✗ Failed to clear session~n~n")
     end,
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "trim" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "trim" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("Trimming memory...~n"),
     try coding_agent_process_monitor:trim() of
         _ -> ok
@@ -517,9 +580,9 @@ process_command(SessionId, History, "trim" ++ Rest) when Rest =:= []; hd(Rest) =
     catch _:_ ->
         io:format("✓ Memory trimmed~n~n")
     end,
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(SessionId, History, "compact" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "compact" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("Compacting session...~n"),
     try coding_agent_session:compact(SessionId) of
         {ok, #{archived_as := ArchiveId, summary_size := SummarySize}} ->
@@ -532,9 +595,9 @@ process_command(SessionId, History, "compact" ++ Rest) when Rest =:= []; hd(Rest
         Type:Error ->
             io:format("✗ Compaction crashed: ~p:~p~n~n", [Type, Error])
     end,
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(SessionId, History, "crashes" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "crashes" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Crashes = try coding_agent_healer:get_crashes() of
         L when is_list(L) -> L;
         {ok, L} -> L;
@@ -551,14 +614,14 @@ process_command(SessionId, History, "crashes" ++ Rest) when Rest =:= []; hd(Rest
     end, lists:sublist(Crashes, 10)),
     io:format("~nUse /fix <id> to attempt auto-fix~n"),
     io:format("Use /reports to list crash report files~n~n"),
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(SessionId, History, "reports" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "reports" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     ReportDir = ".coding_agent_reports",
     case filelib:is_dir(ReportDir) of
         false ->
             io:format("~nNo crash reports directory found.~n~n"),
-            {continue, History};
+            {continue, History, Mode};
         true ->
             Files = filelib:wildcard(filename:join(ReportDir, "*.md")),
             io:format("~nCrash & Fix Reports (~p files):~n", [length(Files)]),
@@ -567,10 +630,10 @@ process_command(SessionId, History, "reports" ++ Rest) when Rest =:= []; hd(Rest
                 io:format("  ~s~n", [Basename])
             end, lists:sort(Files)),
             io:format("~nView with: cat ~s/<file>.md~n~n", [ReportDir]),
-            {continue, History}
+            {continue, History, Mode}
     end;
     
-process_command(SessionId, History, "fix " ++ CrashId) ->
+process_command(SessionId, History, "fix " ++ CrashId, Mode) ->
     Id = list_to_binary(safe_trim(CrashId)),
     io:format("Attempting auto-fix for ~s...~n", [Id]),
     case coding_agent_healer:auto_fix(Id) of
@@ -579,9 +642,9 @@ process_command(SessionId, History, "fix " ++ CrashId) ->
         {error, Reason} ->
             io:format("✗ Auto-fix failed: ~p~n~n", [Reason])
     end,
-    {continue, History};
+    {continue, History, Mode};
     
-process_command(SessionId, History, "sessions" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "sessions" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~nSaved Sessions:~n~n"),
     case coding_agent_session:list_saved_sessions() of
         {ok, SessionIds} when is_list(SessionIds) ->
@@ -599,26 +662,26 @@ process_command(SessionId, History, "sessions" ++ Rest) when Rest =:= []; hd(Res
         {error, Reason} ->
             io:format("  Error listing sessions: ~p~n~n", [Reason])
     end,
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(SessionId, History, "load " ++ SessionIdArg) ->
+process_command(SessionId, History, "load " ++ SessionIdArg, Mode) ->
     LoadId = list_to_binary(string:trim(SessionIdArg)),
     io:format("Loading session ~s...~n", [LoadId]),
     case coding_agent_session:load_session(LoadId) of
         {ok, {NewSessionId, _Pid}} ->
             io:format("✓ Session loaded: ~s~n", [NewSessionId]),
             io:format("Session ID: ~s~n~n", [NewSessionId]),
-            loop(NewSessionId, []);
+            loop(NewSessionId, [], Mode);
         {error, session_not_found} ->
             io:format("✗ Session not found: ~s~n", [LoadId]),
             io:format("Use /sessions to see available sessions.~n~n"),
-            {continue, History};
+            {continue, History, Mode};
         {error, Reason} ->
             io:format("✗ Failed to load session: ~p~n~n", [Reason]),
-            {continue, History}
+            {continue, History, Mode}
     end;
 
-process_command(SessionId, History, "save" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "save" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("Saving session ~s...~n", [SessionId]),
     case coding_agent_session:save_session(SessionId) of
         {ok, SavedId} ->
@@ -626,40 +689,143 @@ process_command(SessionId, History, "save" ++ Rest) when Rest =:= []; hd(Rest) =
         {error, Reason} ->
             io:format("✗ Failed to save session: ~p~n~n", [Reason])
     end,
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(_SessionId, History, "quit" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "quit" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     save_history(History),
     io:format("Goodbye!~n"),
     stop;
     
-process_command(_SessionId, History, "exit" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "exit" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     save_history(History),
     io:format("Goodbye!~n"),
     stop;
 
-process_command(SessionId, History, "dump " ++ Args) ->
+process_command(SessionId, History, "dump " ++ Args, Mode) ->
     [Filename | FormatRest] = string:split(string:trim(Args), " "),
     Format = case FormatRest of
         [F | _] -> string:trim(F);
         [] -> filename:extension(Filename)
     end,
     dump_context(SessionId, History, Filename, Format),
-    {continue, History};
+    {continue, History, Mode};
 
-process_command(SessionId, History, "dump" ++ Rest) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(SessionId, History, "dump" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~nUsage: /dump <filename> [format]~n"),
     io:format("  /dump context.md        - Dump full context to markdown~n"),
     io:format("  /dump context.json      - Dump full context to JSON~n"),
     io:format("  /dump context.txt       - Dump full context to text~n"),
     io:format("~n"),
-    {continue, History};
+    {continue, History, Mode};
 
 
 
-process_command(SessionId, History, Unknown) ->
+%% Plan mode commands
+process_command(SessionId, History, "plan" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    io:format("~n╔════════════════════════════════════════════════════════════╗~n"),
+    io:format("║                    ENTERING PLAN MODE                       ║~n"),
+    io:format("╠════════════════════════════════════════════════════════════╣~n"),
+    io:format("║ In plan mode, you can:                                      ║~n"),
+    io:format("║   - Discuss and refine implementation plans                 ║~n"),
+    io:format("║   - Think through problems step by step                    ║~n"),
+    io:format("║   - Create detailed implementation plans                    ║~n"),
+    io:format("║   - Ask clarifying questions                               ║~n"),
+    io:format("║                                                             ║~n"),
+    io:format("║ Commands:                                                   ║~n"),
+    io:format("║   /build       - Exit plan mode, start implementing         ║~n"),
+    io:format("║   /showplan    - Show current plan                          ║~n"),
+    io:format("║   /editplan    - Edit plan in external editor               ║~n"),
+    io:format("║   /clearplan   - Clear current plan                         ║~n"),
+    io:format("╚════════════════════════════════════════════════════════════╝~n~n"),
+    set_current_mode(plan),
+    {continue, History, plan};
+
+process_command(SessionId, History, "build" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    CurrentPlan = get_current_plan(),
+    set_current_mode(build),
+    io:format("~n╔════════════════════════════════════════════════════════════╗~n"),
+    io:format("║                    ENTERING BUILD MODE                      ║~n"),
+    io:format("╠════════════════════════════════════════════════════════════╣~n"),
+    case byte_size(CurrentPlan) of
+        0 ->
+            io:format("║ No plan has been created yet.                               ║~n"),
+            io:format("║ You can still proceed with implementation.                  ║~n"),
+            io:format("║ Use /plan to create a plan first next time.                 ║~n");
+        _ ->
+            io:format("║ Current plan:~n"),
+            PlanLines = binary:split(CurrentPlan, <<"\n">>, [global]),
+            PlanPreview = lists:sublist(PlanLines, 5),
+            lists:foreach(fun(Line) ->
+                io:format("║   ~s~n", [Line])
+            end, PlanPreview),
+            case length(PlanLines) > 5 of
+                true -> io:format("║   ... (~p more lines)~n", [length(PlanLines) - 5]);
+                false -> ok
+            end
+    end,
+    io:format("╚════════════════════════════════════════════════════════════╝~n~n"),
+    {continue, History, build};
+
+process_command(SessionId, History, "showplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    CurrentPlan = get_current_plan(),
+    io:format("~n"),
+    case byte_size(CurrentPlan) of
+        0 ->
+            io:format("No plan has been created yet.~n"),
+            io:format("Use /plan to enter plan mode and create a plan.~n~n");
+        _ ->
+            io:format("═══════════════════════════════════════════════════════════════~n"),
+            io:format("                        CURRENT PLAN~n"),
+            io:format("═══════════════════════════════════════════════════════════════~n"),
+            io:format("~s~n", [CurrentPlan]),
+            io:format("═══════════════════════════════════════════════════════════════~n~n")
+    end,
+    {continue, History, Mode};
+
+process_command(SessionId, History, "editplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    % Create temp file with current plan
+    TempFile = "/tmp/coding_agent_plan.md",
+    CurrentPlan = get_current_plan(),
+    file:write_file(TempFile, CurrentPlan),
+    
+    % Get editor from environment
+    Editor = os:getenv("EDITOR", "nano"),
+    
+    io:format("~nOpening plan editor (~s)...~n", [Editor]),
+    io:format("Save and exit when done.~n~n"),
+    
+    % Run the editor
+    Port = open_port({spawn, Editor ++ " " ++ TempFile}, [stream, eof]),
+    wait_for_editor(Port),
+    
+    % Read the updated plan
+    case file:read_file(TempFile) of
+        {ok, NewPlan} ->
+            set_current_plan(NewPlan),
+            io:format("~n✓ Plan updated.~n"),
+            io:format("Use /showplan to view it.~n~n");
+        {error, Reason} ->
+            io:format("~n✗ Failed to read plan: ~p~n~n", [Reason])
+    end,
+    {continue, History, Mode};
+
+process_command(SessionId, History, "clearplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    set_current_plan(<<"">>),
+    io:format("~n✓ Plan cleared.~n~n"),
+    {continue, History, Mode};
+
+
+process_command(SessionId, History, Unknown, Mode) ->
     io:format("Unknown command: /~s~nType /help for available commands.~n~n", [Unknown]),
-    {continue, History}.
+    {continue, History, Mode}.
+
+wait_for_editor(Port) ->
+    receive
+        {Port, {data, _}} ->
+            wait_for_editor(Port);
+        {Port, eof} ->
+            port_close(Port)
+    end.
 
 print_model_field(Map, Key, Label) ->
     case maps:get(Key, Map, undefined) of
@@ -668,44 +834,78 @@ print_model_field(Map, Key, Label) ->
         _ -> ok
     end.
 
-process_message(SessionId, History, Input) ->
-    process_message(SessionId, History, Input, 0).
+process_message(SessionId, History, Input, Mode) ->
+    process_message(SessionId, History, Input, Mode, 0).
 
-process_message(SessionId, History, Input, RetryCount) when RetryCount >= 3 ->
+process_message(SessionId, History, Input, Mode, RetryCount) when RetryCount >= 3 ->
     io:format("~nMax retries exceeded. Please try again.~n"),
-    {continue, History};
-process_message(SessionId, History, Input, RetryCount) ->
+    {continue, History, Mode};
+process_message(SessionId, History, Input, Mode, RetryCount) ->
     Message = list_to_binary(Input),
     NewHistory = [Input | History],
     
+    % Get mode-specific system prompt
+    ModePrompt = get_mode_system_prompt(Mode),
+    CurrentPlan = get_current_plan(),
+    
+    % Add mode and plan context to the message
+    ModeContext = case Mode of
+        plan ->
+            PlanContext = case byte_size(CurrentPlan) of
+                0 -> <<"">>;
+                _ -> iolist_to_binary([<<"\n\nCURRENT PLAN:\n">>, CurrentPlan, <<"\n\n">>])
+            end,
+            iolist_to_binary([
+                <<"\n[PLAN MODE] You are in plan mode. Your role is to:\n">>,
+                <<"1. Discuss and refine implementation plans with the user\n">>,
+                <<"2. Think through problems step by step\n">>,
+                <<"3. Create detailed implementation plans\n">>,
+                <<"4. Ask clarifying questions\n">>,
+                <<"5. DO NOT execute any code or file operations - just discuss\n">>,
+                <<"6. When the plan is ready, suggest using /build to implement it\n">>,
+                PlanContext,
+                <<"\n">>
+            ]);
+        build ->
+            iolist_to_binary([
+                <<"\n[BUILD MODE] You are in build mode. You can:\n">>,
+                <<"1. Execute code and file operations\n">>,
+                <<"2. Implement the plan you created\n">>,
+                <<"3. Make changes to files\n">>,
+                <<"\n">>
+            ])
+    end,
+    
+    EnrichedMessage = iolist_to_binary([ModeContext, Message]),
+    
     io:format("~nThinking...~n"),
-    try coding_agent_session:ask(SessionId, Message) of
+    try coding_agent_session:ask(SessionId, EnrichedMessage) of
         {ok, Response, _Thinking, _History} ->
             io:format("~n--- Response ---~n"),
             print_response(Response),
             io:format("~n"),
-            {continue, NewHistory};
+            {continue, NewHistory, Mode};
         {error, session_not_found} ->
             io:format("~nSession expired. Creating new session...~n"),
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
-            process_message(NewSessionId, NewHistory, Input, 0);
+            process_message(NewSessionId, NewHistory, Input, Mode, 0);
         {error, Reason} ->
             io:format("Error: ~p~n~n", [Reason]),
             report_error(Reason, SessionId),
-            {continue, NewHistory}
+            {continue, NewHistory, Mode}
     catch
         exit:{timeout, _} ->
             io:format("~nRequest timed out. Retrying (~p/3)...~n", [RetryCount + 1]),
             timer:sleep(1000 * (RetryCount + 1)),
-            process_message(SessionId, History, Input, RetryCount + 1);
+            process_message(SessionId, History, Input, Mode, RetryCount + 1);
         error:undef:Stacktrace ->
             io:format("~n⚠ Undefined function error:~n"),
             lists:foreach(fun({M, F, A, Loc}) ->
                 io:format("  ~p:~p/~p at ~p~n", [M, F, A, Loc])
             end, Stacktrace),
             io:format("~nPlease recompile and restart.~n"),
-            {continue, History};
+            {continue, History, Mode};
         Type:Error:Stacktrace ->
             io:format("~n⚠ Session crashed: ~p:~p~n", [Type, Error]),
             report_crash(Type, Error, Stacktrace, SessionId),
@@ -715,8 +915,19 @@ process_message(SessionId, History, Input, RetryCount) ->
             end,
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
-            {new_session, NewSessionId, NewHistory}
+            {new_session, NewSessionId, NewHistory, Mode}
     end.
+
+get_mode_system_prompt(build) ->
+    <<"">>;
+get_mode_system_prompt(plan) ->
+    <<"You are in PLAN MODE. In this mode, you should:
+1. Discuss and refine plans with the user
+2. Think through problems step by step
+3. Create detailed implementation plans
+4. Ask clarifying questions
+5. DO NOT execute any tools that modify files or run code
+6. When the plan is ready, suggest using /build to implement it">>.
 
 report_error(Reason, SessionId) ->
     % Don't log HTTP/API errors to crash report - they're handled by retry
