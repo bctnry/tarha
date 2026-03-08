@@ -1,11 +1,14 @@
 -module(coding_agent_session).
 -behaviour(gen_server).
 
+-compile({no_auto_import, [halt/1]}).
+
 -export([start_link/0, start_link/1, start_link/2, new/0, new/1, ask/2, ask/3]).
 -export([history/1, clear/1, stop_session/1, sessions/0]).
 -export([open_files/1, close_file/2, stats/1, ask_stream/3, compact/1]).
 -export([save_session/1, load_session/1, list_saved_sessions/0]).
 -export([set_context_length/2, get_context_length/1]).
+-export([halt/1, is_busy/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
@@ -18,14 +21,17 @@
     prompt_tokens :: integer(),      % Actual tokens from API
     completion_tokens :: integer(),  % Actual tokens from API  
     estimated_tokens :: integer(),    % Estimated when API doesn't provide counts
-    tool_calls :: integer()
+    tool_calls :: integer(),
+    busy :: boolean()                 % Whether session is processing a request
 }).
 
 -define(MAX_ITERATIONS, 100).
--define(MAX_HISTORY, 100).
+-define(MAX_HISTORY, 50).  % Reduced from 100 - tool calls use lots of context
+-define(MAX_HISTORY_SIZE, 100000).  % 100KB max history in bytes
+-define(MAX_TOOL_RESULT_SIZE, 10000).  % 10KB max per tool result (was 20KB)
 -define(DEFAULT_CONTEXT_LENGTH, 32768).  % Default if model info unavailable
--define(CONTEXT_USAGE_THRESHOLD, 2.0).  % Effectively disabled (200%)
--define(COMPACTION_THRESHOLD, 999999999).  % Effectively disabled
+-define(CONTEXT_USAGE_THRESHOLD, 0.75).  % Compact at 75% context usage
+-define(COMPACTION_THRESHOLD, 150000).  % ~50KB tokens
 -define(ARCHIVE_DIR, ".tarha/sessions").
 -define(CRASH_DIR, ".tarha/reports").
 -define(MAX_TOOL_RETRIES, 3).
@@ -251,6 +257,28 @@ stop_session({Id, Pid}) ->
     ets:delete(?SESSIONS_TABLE, Id),
     stop_session(Pid).
 
+%% @doc Halt the current LLM request for a session
+halt(Session) when is_pid(Session) ->
+    gen_server:call(Session, halt, 5000);
+halt(Session) when is_binary(Session) ->
+    case ets:lookup(?SESSIONS_TABLE, Session) of
+        [{_, Pid}] -> halt(Pid);
+        [] -> {error, session_not_found}
+    end;
+halt({_, Pid}) ->
+    halt(Pid).
+
+%% @doc Check if session is busy processing a request
+is_busy(Session) when is_pid(Session) ->
+    gen_server:call(Session, is_busy);
+is_busy(Session) when is_binary(Session) ->
+    case ets:lookup(?SESSIONS_TABLE, Session) of
+        [{_, Pid}] -> is_busy(Pid);
+        [] -> {error, session_not_found}
+    end;
+is_busy({_, Pid}) ->
+    is_busy(Pid).
+
 start_link() ->
     start_link(<<>>).
 
@@ -295,7 +323,8 @@ init([Id, WorkingDir]) ->
         prompt_tokens = 0,
         completion_tokens = 0,
         estimated_tokens = 0,
-        tool_calls = 0
+        tool_calls = 0,
+        busy = false
     }}.
 
 handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages = History, working_dir = WD, id = Id, open_files = OpenFiles}) ->
@@ -358,7 +387,7 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
     ExistingHistory = trim_history(History),
     Messages = [SystemMsg | ExistingHistory] ++ [UserMsg],
     
-    case run_agent_loop(Model, Messages, 0, OpenFiles) of
+    case run_agent_loop(Model, Messages, 0, OpenFiles, Id) of
         {ok, Response, Thinking, NewHistory, FinalOpenFiles, TokenInfo} ->
             FinalHistory = trim_history(NewHistory, ?MAX_HISTORY),
             ReplyHistory = [{maps:get(<<"role">>, M), maps:get(<<"content">>, M, <<"">>)} || M <- lists:sublist(FinalHistory, 2, length(FinalHistory))],
@@ -444,6 +473,23 @@ handle_call({set_context_length, Length}, _From, State = #state{context_length =
     {reply, {ok, #{old_length => OldLength, new_length => Length}}, State#state{context_length = Length}};
 handle_call({set_context_length, Length}, _From, State) ->
     {reply, {error, {invalid_length, Length}}, State};
+
+handle_call(halt, _From, State = #state{id = SessionId}) ->
+    %% Halt any active LLM request for this session
+    case coding_agent_request_registry:halt(SessionId) of
+        ok ->
+            io:format("[session] Halted request for session ~s~n", [SessionId]),
+            {reply, ok, State};
+        {error, not_found} ->
+            {reply, {error, no_active_request}, State}
+    end;
+
+handle_call(is_busy, _From, State = #state{id = SessionId}) ->
+    %% Check if there's an active request for this session
+    case coding_agent_request_registry:get_request(SessionId) of
+        {ok, _Ref} -> {reply, {ok, true}, State};
+        {error, not_found} -> {reply, {ok, false}, State}
+    end;
 
 handle_call(compact, _From, State = #state{id = Id, messages = Messages, model = Model, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET}) ->
     TotalTokens = PT + CT + ET,
@@ -545,11 +591,11 @@ build_file_context(OpenFiles) ->
     end, <<>>, OpenFiles).
 
 %% Token counting now uses API-provided counts when available
-run_agent_loop(Model, Messages, Iteration, OpenFiles) when Iteration >= ?MAX_ITERATIONS ->
+run_agent_loop(_Model, Messages, Iteration, _OpenFiles, _SessionId) when Iteration >= ?MAX_ITERATIONS ->
     {error, max_iterations_reached, Messages};
-run_agent_loop(Model, Messages, Iteration, OpenFiles) ->
+run_agent_loop(Model, Messages, Iteration, OpenFiles, SessionId) ->
     Tools = coding_agent_tools:tools(),
-    case coding_agent_ollama:chat_with_tools(Model, Messages, Tools) of
+    case coding_agent_ollama:chat_with_tools_cancellable(SessionId, Model, Messages, Tools) of
         {ok, #{<<"message">> := ResponseMsg} = Response} ->
             %% Extract actual token count from API response if available
             TokenInfo = maps:get(token_info, Response, #{}),
@@ -568,12 +614,14 @@ run_agent_loop(Model, Messages, Iteration, OpenFiles) ->
                     EstTokens = coding_agent_ollama:count_tokens(Messages),
                     #{prompt_tokens => 0, completion_tokens => 0, estimated_tokens => EstTokens}
             end,
-            handle_response(Model, Messages, ResponseMsg, Iteration, OpenFiles, TokenInfoMap);
+            handle_response(Model, Messages, ResponseMsg, Iteration, OpenFiles, TokenInfoMap, SessionId);
+        {error, halted} ->
+            {error, request_halted};
         {error, Reason} ->
             {error, Reason}
     end.
 
-handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles, TokenInfo) ->
+handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles, TokenInfo, SessionId) ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     %% Display thinking before executing tool calls
     display_thinking(Thinking),
@@ -584,16 +632,19 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
     },
     UpdatedMessages = Messages ++ [AssistantMsg],
     {ToolResults, NewOpenFiles} = execute_tool_calls(ToolCalls, OpenFiles),
-    ToolMsg = #{<<"role">> => <<"tool">>, <<"content">> => ToolResults},
+    
+    %% Summarize tool results if too large
+    SummarizedResults = summarize_if_large(ToolResults, ?MAX_TOOL_RESULT_SIZE),
+    ToolMsg = #{<<"role">> => <<"tool">>, <<"content">> => SummarizedResults},
     MessagesWithResults = UpdatedMessages ++ [ToolMsg],
     
     %% Estimate tokens for tool results (not included in API response)
-    ToolResultTokens = coding_agent_ollama:count_tokens(ToolResults),
+    ToolResultTokens = coding_agent_ollama:count_tokens(SummarizedResults),
     UpdatedTokenInfo = TokenInfo#{
         estimated_tokens => maps:get(estimated_tokens, TokenInfo, 0) + ToolResultTokens
     },
     
-    case run_agent_loop(Model, MessagesWithResults, Iteration + 1, NewOpenFiles) of
+    case run_agent_loop(Model, MessagesWithResults, Iteration + 1, NewOpenFiles, SessionId) of
         {ok, Response, NewThinking, NewHistory, FinalOpenFiles, MoreTokenInfo} ->
             CombinedThinking = case Thinking of
                 <<>> -> NewThinking;
@@ -610,13 +661,13 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
             {error, Reason}
     end;
 
-handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles, TokenInfo) when Content =/= <<>>, Content =/= nil ->
+handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles, TokenInfo, _SessionId) when Content =/= <<>>, Content =/= nil ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     AssistantMsg = #{<<"role">> => <<"assistant">>, <<"content">> => Content},
     NewHistory = Messages ++ [AssistantMsg],
     {ok, Content, Thinking, NewHistory, OpenFiles, TokenInfo};
 
-handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles, _TokenInfo) ->
+handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles, _TokenInfo, _SessionId) ->
     {error, unexpected_response}.
 
 execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
@@ -630,7 +681,7 @@ execute_tool_calls(ToolCalls, OpenFiles) when is_list(ToolCalls) ->
         (_, Acc) -> Acc
     end, OpenFiles, Results),
     ResultList = [R || {R, _} <- Results],
-    SafeResults = limit_results(ResultList, 20000),
+    SafeResults = limit_results(ResultList, ?MAX_TOOL_RESULT_SIZE),
     ResultBin = serialize_results(SafeResults),
     {ResultBin, NewOpenFiles}.
 
@@ -750,30 +801,53 @@ generate_id() ->
     iolist_to_binary(io_lib:format("~8.16.0b-~8.16.0b-~8.16.0b", [A, B, C])).
 
 trim_history(History) ->
-    trim_history(History, ?DEFAULT_CONTEXT_LENGTH).
+    trim_history(History, ?MAX_HISTORY, ?MAX_HISTORY_SIZE).
 
-trim_history(History, MaxTokens) when is_integer(MaxTokens) ->
-    HistorySize = coding_agent_ollama:count_tokens(History),
-    case HistorySize > MaxTokens of
-        false -> History;
-        true ->
-            % Remove oldest messages until we're under limit
-            % Keep system message (first) and last message
-            case length(History) of
-                N when N =< 2 -> History;
-                _ ->
-                    % Remove the oldest non-system message
-                    [SysMsg | Rest] = History,
-                    case Rest of
-                        [] -> [SysMsg];
-                        [Last] -> [SysMsg, Last];
-                        _ ->
-                            NewRest = lists:droplast(Rest),
-                            Last = lists:last(Rest),
-                            trim_history([SysMsg | NewRest] ++ [Last], MaxTokens)
-                    end
-            end
+trim_history(History, MaxCount, MaxSize) ->
+    % First trim by count
+    TrimmedByCount = case length(History) > MaxCount of
+        true -> lists:sublist(History, MaxCount);
+        false -> History
+    end,
+    % Then trim by size (keep most recent, drop oldest)
+    HistorySize = estimate_history_size(TrimmedByCount),
+    case HistorySize > MaxSize of
+        true -> trim_by_size(TrimmedByCount, MaxSize);
+        false -> TrimmedByCount
     end.
+
+estimate_history_size([]) -> 0;
+estimate_history_size([Msg | Rest]) ->
+    Content = maps:get(<<"content">>, Msg, <<>>),
+    Size = case is_binary(Content) of
+        true -> byte_size(Content);
+        _ -> 0
+    end,
+    Size + estimate_history_size(Rest).
+
+trim_by_size([], _MaxSize) -> [];
+trim_by_size(History, MaxSize) ->
+    % Drop oldest messages until under size
+    case estimate_history_size(History) > MaxSize of
+        true -> trim_by_size(tl(History), MaxSize);
+        false -> History
+    end.
+
+%% Summarize tool results if they're too large
+summarize_if_large(Results, MaxSize) when is_binary(Results) ->
+    case byte_size(Results) > MaxSize of
+        true ->
+            % Extract key info and truncate
+            <<First:(MaxSize div 2)/binary, _/binary>> = Results,
+            <<First/binary, "\n... [result truncated due to size]">>;
+        false -> Results
+    end;
+summarize_if_large(Results, MaxSize) when is_list(Results) ->
+    % Convert to binary first
+    ResultsBin = try jsx:encode(Results)
+    catch _:_ -> iolist_to_binary(io_lib:format("~p", [Results]))
+    end,
+    summarize_if_large(ResultsBin, MaxSize).
 
 %% Self-healing: Check for recent crash reports and include in context
 get_recent_crash_context() ->

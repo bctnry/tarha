@@ -37,6 +37,7 @@
         coding_agent_http,
         coding_agent_zulip,
         coding_agent_config,
-        coding_agent_undo
+        coding_agent_undo,
+        coding_agent_request_registry
        ]}
    ]}.

@@ -27,6 +27,8 @@ start_link(Options) ->
             {"/chat/stream", ?MODULE, #{action => chat_stream}},
             {"/session", ?MODULE, #{action => session}},
             {"/session/:id", ?MODULE, #{action => session_info}},
+            {"/session/:id/halt", ?MODULE, #{action => session_halt}},
+            {"/session/:id/busy", ?MODULE, #{action => session_busy}},
             {"/session/:id/save", ?MODULE, #{action => session_save}},
             {"/session/:id/load", ?MODULE, #{action => session_load}},
             {"/sessions", ?MODULE, #{action => sessions_list}},
@@ -105,6 +107,8 @@ handle_action(<<"GET">>, index, _Req) ->
             #{method => <<"POST">>, path => <<"/chat/stream">>, description => <<"Stream response with thinking">>},
             #{method => <<"POST">>, path => <<"/session">>, description => <<"Create session">>},
             #{method => <<"GET">>, path => <<"/session/:id">>, description => <<"Get session info">>},
+            #{method => <<"POST">>, path => <<"/session/:id/halt">>, description => <<"Halt active LLM request">>},
+            #{method => <<"GET">>, path => <<"/session/:id/busy">>, description => <<"Check if session is busy">>},
             #{method => <<"POST">>, path => <<"/session/:id/save">>, description => <<"Save session to disk">>},
             #{method => <<"POST">>, path => <<"/session/:id/load">>, description => <<"Load session from disk">>},
             #{method => <<"GET">>, path => <<"/sessions">>, description => <<"List saved sessions">>},
@@ -310,6 +314,25 @@ handle_action(<<"GET">>, model_show, Req) ->
             }};
         {error, Reason} ->
             {error, 500, io_lib:format("~p", [Reason])}
+    end;
+
+%% Halt the current LLM request for a session
+handle_action(<<"POST">>, session_halt, Req) ->
+    SessionId = cowboy_req:binding(id, Req),
+    case coding_agent_session:halt(SessionId) of
+        ok -> {ok, #{session_id => SessionId, status => halted}};
+        {error, no_active_request} -> {ok, #{session_id => SessionId, status => idle, message => <<"No active request to halt">>}};
+        {error, session_not_found} -> {error, 404, session_not_found};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
+    end;
+
+%% Check if session is busy processing a request
+handle_action(<<"GET">>, session_busy, Req) ->
+    SessionId = cowboy_req:binding(id, Req),
+    case coding_agent_session:is_busy(SessionId) of
+        {ok, Busy} -> {ok, #{session_id => SessionId, busy => Busy}};
+        {error, session_not_found} -> {error, 404, session_not_found};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
     end;
 
 handle_action(_, _, _Req) ->

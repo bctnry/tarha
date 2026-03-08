@@ -9,6 +9,12 @@ start_link() ->
 
 init([]) ->
     BaseChildren = [
+        #{id => coding_agent_request_registry,
+          start => {coding_agent_request_registry, start_link, []},
+          restart => permanent,
+          shutdown => 5000,
+          type => worker,
+          modules => [coding_agent_request_registry]},
         #{id => coding_agent_undo,
           start => {coding_agent_undo, start_link, []},
           restart => permanent,
