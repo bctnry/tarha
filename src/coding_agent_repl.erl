@@ -134,7 +134,15 @@ safe_trim(String) ->
     end.
 
 process_input(SessionId, History, Input) ->
-    process_input_impl(SessionId, History, Input).
+    try process_input_impl(SessionId, History, Input) of
+        Result -> Result
+    catch
+        Type:Error:Stacktrace ->
+            io:format("~n** Command crashed: ~p:~p~n", [Type, Error]),
+            report_crash(Type, Error, Stacktrace, SessionId),
+            io:format("~n"),
+            {continue, History}
+    end.
 
 process_input_impl(_SessionId, History, "") ->
     {continue, History};
