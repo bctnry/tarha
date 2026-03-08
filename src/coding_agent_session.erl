@@ -386,12 +386,12 @@ handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages
     
     SystemMsg = #{<<"role">> => <<"system">>, <<"content">> => SystemContent},
     UserMsg = #{<<"role">> => <<"user">>, <<"content">> => MsgBin},
-    ExistingHistory = trim_history(History),
+    ExistingHistory = strip_system_messages(trim_history(History)),
     Messages = [SystemMsg | ExistingHistory] ++ [UserMsg],
     
     case run_agent_loop(Model, Messages, 0, OpenFiles, Id) of
         {ok, Response, Thinking, NewHistory, FinalOpenFiles, TokenInfo} ->
-            FinalHistory = trim_history(NewHistory),
+            FinalHistory = strip_system_messages(trim_history(NewHistory)),
             ReplyHistory = [{maps:get(<<"role">>, M), maps:get(<<"content">>, M, <<"">>)} || M <- lists:sublist(FinalHistory, 2, length(FinalHistory))],
             
             %% Extract token counts
@@ -625,7 +625,6 @@ run_agent_loop(Model, Messages, Iteration, OpenFiles, SessionId) ->
 
 handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg, Iteration, OpenFiles, TokenInfo, SessionId) ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
-    %% Display thinking before executing tool calls
     display_thinking(Thinking),
     AssistantMsg = #{
         <<"role">> => <<"assistant">>,
@@ -635,12 +634,10 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
     UpdatedMessages = Messages ++ [AssistantMsg],
     {ToolResults, NewOpenFiles} = execute_tool_calls(ToolCalls, OpenFiles),
     
-    %% Summarize tool results if too large
     SummarizedResults = summarize_if_large(ToolResults, ?MAX_TOOL_RESULT_SIZE),
     ToolMsg = #{<<"role">> => <<"tool">>, <<"content">> => SummarizedResults},
     MessagesWithResults = UpdatedMessages ++ [ToolMsg],
     
-    %% Estimate tokens for tool results (not included in API response)
     ToolResultTokens = coding_agent_ollama:count_tokens(SummarizedResults),
     UpdatedTokenInfo = TokenInfo#{
         estimated_tokens => maps:get(estimated_tokens, TokenInfo, 0) + ToolResultTokens
@@ -652,7 +649,6 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
                 <<>> -> NewThinking;
                 _ -> <<Thinking/binary, "\n\n", NewThinking/binary>>
             end,
-            %% Merge token info
             MergedTokenInfo = #{
                 prompt_tokens => maps:get(prompt_tokens, TokenInfo, 0) + maps:get(prompt_tokens, MoreTokenInfo, 0),
                 completion_tokens => maps:get(completion_tokens, TokenInfo, 0) + maps:get(completion_tokens, MoreTokenInfo, 0),
@@ -804,6 +800,15 @@ generate_id() ->
 
 trim_history(History) ->
     trim_history(History, ?MAX_HISTORY, ?MAX_HISTORY_SIZE).
+
+%% Strip system messages from history to avoid duplication
+strip_system_messages(History) when is_list(History) ->
+    lists:filter(fun(Msg) ->
+        case maps:get(<<"role">>, Msg, undefined) of
+            <<"system">> -> false;
+            _ -> true
+        end
+    end, History).
 
 trim_history(History, MaxCount, MaxSize) ->
     % First trim by count
@@ -992,8 +997,8 @@ compact_session(State = #state{id = Id, messages = Messages, model = Model,
             case summarize_messages_with_timeout(OldMsgs, Model, ?SUMMARIZE_TIMEOUT) of
                 {ok, SummaryText} ->
                     SummaryMsg = #{
-                        <<"role">> => <<"system">>,
-                        <<"content">> => <<"Previous conversation summary:\n\n", SummaryText/binary>>
+                        <<"role">> => <<"user">>,
+                        <<"content">> => <<"[Context from previous conversation]\n", SummaryText/binary>>
                     },
                     io:format("[session] Session compacted. Archived as ~s~n", [ArchiveId]),
                     {ok, [SummaryMsg | RecentMsgs]};

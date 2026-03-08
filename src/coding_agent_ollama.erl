@@ -609,13 +609,80 @@ get_token_stats() ->
 %% ============================================================================
 
 %% @doc Chat with tools that can be cancelled by session ID
-%% Uses spawn_link to run request in separate process for cancellation
--spec chat_with_tools_cancellable(binary(), binary(), list(), binary()) -> 
+%% Uses async HTTP request with cancellation support via request registry
+-spec chat_with_tools_cancellable(binary(), binary(), list(), list()) -> 
     {ok, map()} | {error, term()}.
 chat_with_tools_cancellable(SessionId, Model, Messages, Tools) when is_binary(SessionId) ->
-    %% For now, just use the non-cancellable version
-    %% Cancellation requires more complex process management
-    do_chat_with_tools(Model, Messages, Tools).
+    Host = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
+    Url = Host ++ "/api/chat",
+    
+    % Check model capabilities
+    SupportsThinking = model_supports_thinking(Model),
+    SupportsTools = model_supports_tools(Model),
+    
+    Body = jsx:encode(#{
+        model => Model,
+        messages => Messages,
+        tools => case SupportsTools of true -> Tools; false -> [] end,
+        think => SupportsThinking,
+        stream => false
+    }),
+    
+    Headers = [{<<"Content-Type">>, <<"application/json">>}],
+    
+    % Use async request to allow cancellation
+    case hackney:request(post, Url, Headers, Body, [{recv_timeout, 300000}, {stream, self()}]) of
+        {ok, _StatusCode, _Headers, Ref} when is_reference(Ref) ->
+            % Register the request for cancellation
+            case coding_agent_request_registry:register(SessionId, Ref) of
+                ok ->
+                    Result = collect_cancellable_response(SessionId, Ref, #{}),
+                    coding_agent_request_registry:unregister(SessionId),
+                    Result;
+                {error, already_exists} ->
+                    hackney_manager:cancel_request(Ref),
+                    {error, request_already_in_progress}
+            end;
+        {ok, _Ref} ->
+            {error, invalid_reference};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Collect non-streaming response with cancellation support
+collect_cancellable_response(SessionId, Ref, ResponseAcc) ->
+    receive
+        {request_halted, SessionId, Ref} ->
+            {error, halted};
+        {hackney_response, Ref, {done, _}} ->
+            % Build final response
+            Resp = ResponseAcc,
+            % Extract token counts from response
+            PromptTokens = maps:get(<<"prompt_eval_count">>, Resp, undefined),
+            CompletionTokens = maps:get(<<"eval_count">>, Resp, undefined),
+            TokenInfo = #{
+                prompt_tokens => PromptTokens,
+                completion_tokens => CompletionTokens,
+                total_tokens => case {PromptTokens, CompletionTokens} of
+                    {P, C} when is_integer(P), is_integer(C) -> P + C;
+                    _ -> undefined
+                end
+            },
+            {ok, Resp#{token_info => TokenInfo}};
+        {hackney_response, Ref, Data} ->
+            case jsx:is_json(Data) of
+                true ->
+                    Chunk = jsx:decode(Data, [return_maps]),
+                    NewAcc = maps:merge(ResponseAcc, Chunk),
+                    collect_cancellable_response(SessionId, Ref, NewAcc);
+                false ->
+                    collect_cancellable_response(SessionId, Ref, ResponseAcc)
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    after 300000 ->
+        {error, timeout}
+    end.
 
 %% @doc Streaming chat with cancellation support
 %% Returns {ok, Ref} where Ref can be used to cancel the request
