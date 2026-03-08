@@ -727,21 +727,150 @@ report_error(Reason, SessionId) ->
     end.
 
 report_crash(Type, Error, Stacktrace, SessionId) ->
+    %% Always write crash report, even if healer is unavailable
+    CrashInfo = #{
+        type => Type,
+        error => Error,
+        stacktrace => Stacktrace,
+        session_id => SessionId,
+        timestamp => erlang:system_time(millisecond)
+    },
+    
+    %% Write crash report directly to disk
+    CrashReportContent = generate_crash_report_content(CrashInfo),
+    CrashId = generate_crash_id(),
+    CrashDir = ".tarha/reports",
+    filelib:ensure_dir(CrashDir ++ "/"),
+    Filename = filename:join(CrashDir, binary_to_list(CrashId) ++ ".md"),
+    
+    case file:write_file(Filename, CrashReportContent) of
+        ok -> io:format("Crash report saved: ~s~n", [Filename]);
+        _ -> io:format("Failed to write crash report~n")
+    end,
+    
+    %% Try healer if available
     try
         case whereis(coding_agent_healer) of
-            undefined -> ok;
+            undefined -> 
+                %% Healer not available - still analyze locally
+                analyze_and_suggest_fix(Error, Stacktrace);
             _ ->
                 coding_agent_healer:report_crash(repl_crash, {Type, Error}, Stacktrace, #{session_id => SessionId}),
-                io:format("Crash logged.~n"),
+                io:format("Crash logged to healer.~n"),
                 {_, CrashAnalysis} = coding_agent_healer:analyze_crash(Type, Stacktrace),
-                case maps:get(suggested_fix, CrashAnalysis, #{}) of
-                    #{hint := Hint} -> io:format("Suggestion: ~s~n", [Hint]);
-                    _ -> ok
-                end
+                display_suggestion(CrashAnalysis)
         end
     catch
-        _:_ -> 
-            io:format("Could not log crash (healer unavailable).~n")
+        _:_ ->
+            %% Healer failed - analyze locally
+            analyze_and_suggest_fix(Error, Stacktrace)
+    end.
+
+generate_crash_id() ->
+    <<A:32, B:32>> = crypto:strong_rand_bytes(8),
+    iolist_to_binary(io_lib:format("crash-~8.16.0b-~8.16.0b", [A, B])).
+
+generate_crash_report_content(CrashInfo) ->
+    Type = maps:get(type, CrashInfo, unknown),
+    Error = maps:get(error, CrashInfo, unknown),
+    Stacktrace = maps:get(stacktrace, CrashInfo, []),
+    SessionId = maps:get(session_id, CrashInfo, undefined),
+    Timestamp = maps:get(timestamp, CrashInfo, 0),
+    
+    SessionSection = case SessionId of
+        undefined -> <<"">>;
+        Sid -> io_lib:format("**Session ID:** ~s~n~n", [Sid])
+    end,
+    
+    ErrorStr = io_lib:format("~p", [Error]),
+    StackStr = format_stacktrace(Stacktrace),
+    
+    iolist_to_binary([
+        <<"# Crash Report~n~n">>,
+        io_lib:format("**Crash ID:** crash-~p~n~n", [Timestamp]),
+        io_lib:format("**Timestamp:** ~p (UTC)~n~n", [Timestamp]),
+        SessionSection,
+        <<"**Error Type:** ">>, atom_to_binary(Type, utf8), <<"~n~n">>,
+        <<"**Error:**~n~n```~n">>, ErrorStr, <<"~n```~n~n">>,
+        <<"**Stacktrace:**~n~n```~n">>, StackStr, <<"~n```~n">>
+    ]).
+
+format_stacktrace([]) -> <<"">>;
+format_stacktrace([{M, F, A, Info} | Rest]) when is_list(A) ->
+    Line = io_lib:format("  ~p:~p/~p at ~s:~p~n", [
+        M, F, length(A),
+        proplists:get_value(file, Info, "unknown"),
+        proplists:get_value(line, Info, 0)
+    ]),
+    [Line | format_stacktrace(Rest)];
+format_stacktrace([{M, F, A, Info} | Rest]) ->
+    Line = io_lib:format("  ~p:~p/~p at ~s:~p~n", [
+        M, F, A,
+        proplists:get_value(file, Info, "unknown"),
+        proplists:get_value(line, Info, 0)
+    ]),
+    [Line | format_stacktrace(Rest)];
+format_stacktrace([{M, F, A} | Rest]) ->
+    Line = io_lib:format("  ~p:~p/~p~n", [M, F, A]),
+    [Line | format_stacktrace(Rest)];
+format_stacktrace([_ | Rest]) ->
+    format_stacktrace(Rest).
+
+analyze_and_suggest_fix(Error, Stacktrace) ->
+    %% Show the error clearly
+    io:format("~n** Error: ~p~n", [Error]),
+    io:format("~n** Stacktrace:~n"),
+    lists:foreach(fun
+        ({M, F, A, Info}) ->
+            File = proplists:get_value(file, Info, "unknown"),
+            Line = proplists:get_value(line, Info, 0),
+            Arity = if is_list(A) -> length(A); true -> A end,
+            io:format("    ~p:~p/~p at ~s:~p~n", [M, F, Arity, File, Line]);
+        ({M, F, A}) ->
+            Arity = if is_list(A) -> length(A); true -> A end,
+            io:format("    ~p:~p/~p~n", [M, F, Arity]);
+        (_) ->
+            io:format("    (unknown location)~n")
+    end, Stacktrace),
+    
+    %% Suggest fix based on error type
+    case Error of
+        {undef, {Mod, Fun, Arity}} when is_atom(Mod), is_atom(Fun) ->
+            %% Check if function exists in another module
+            case find_function_in_modules(Mod, Fun, Arity) of
+                {ok, CorrectMod} ->
+                    io:format("~n** SUGGESTED FIX:** Use ~p:~p/~p instead of ~p:~p/~p~n~n",
+                              [CorrectMod, Fun, Arity, Mod, Fun, Arity]);
+                not_found ->
+                    io:format("~n** SUGGESTED FIX:** Function ~p:~p/~p not found. Add -export or define it.~n~n",
+                              [Mod, Fun, Arity])
+            end;
+        {badarg, _} ->
+            io:format("~n** SUGGESTED FIX:** Bad argument. Check function arguments.~n~n", []);
+        {badmatch, _} ->
+            io:format("~n** SUGGESTED FIX:** Pattern match failed. Check data structure.~n~n", []);
+        {case_clause, _} ->
+            io:format("~n** SUGGESTED FIX:** No case clause matched. Add missing case.~n~n", []);
+        _ ->
+            io:format("~n** Run /fix or /crashes for more details**~n~n", [])
+    end.
+
+find_function_in_modules(_WrongMod, Fun, Arity) ->
+    CommonModules = [lists, string, binary, file, filename, os, io, 
+                     proplists, maps, sets, dict, queue, array,
+                     re, unicode, calendar, timer, erlang],
+    Found = lists:filter(fun(Mod) ->
+        erlang:function_exported(Mod, Fun, Arity)
+    end, CommonModules),
+    case Found of
+        [CorrectMod | _] -> {ok, CorrectMod};
+        [] -> not_found
+    end.
+
+display_suggestion(CrashAnalysis) ->
+    case maps:get(suggested_fix, CrashAnalysis, #{}) of
+        #{hint := Hint} -> io:format("Suggestion: ~s~n", [Hint]);
+        _ -> ok
     end.
 
 report_error(Reason) ->
