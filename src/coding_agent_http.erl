@@ -44,7 +44,10 @@ start_link(Options) ->
             {"/tools", ?MODULE, #{action => tools}},
             {"/models", ?MODULE, #{action => models}},
             {"/model", ?MODULE, #{action => model}},
-            {"/model/:name", ?MODULE, #{action => model_show}}
+            {"/model/:name", ?MODULE, #{action => model_show}},
+            %% Session viewer static files
+            {"/viewer", ?MODULE, #{action => viewer_index}},
+            {"/viewer/[...]", ?MODULE, #{action => viewer_static}}
         ]}
     ]),
     
@@ -72,6 +75,10 @@ init(Req, State) ->
             try handle_action(Method, Action, Req) of
                 {stream, Req2} ->
                     %% Streaming response - already handled
+                    {ok, Req2, State};
+                {ok, #{content := Content, headers := Headers}} ->
+                    %% Static file response
+                    Req2 = cowboy_req:reply(200, Headers, Content, Req),
                     {ok, Req2, State};
                 {ok, Response} ->
                     Headers = maps:merge(?CORS_HEADERS, #{<<"content-type">> => <<"application/json">>}),
@@ -379,10 +386,60 @@ handle_action(<<"GET">>, session_busy, Req) ->
         {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
     end;
 
+%% Session viewer static files
+handle_action(<<"GET">>, viewer_index, Req) ->
+    serve_static_file(<<"index.html">>, Req);
+
+handle_action(<<"GET">>, viewer_static, Req) ->
+    PathInfo = cowboy_req:path_info(Req),
+    FileName = case PathInfo of
+        [] -> <<"index.html">>;
+        Parts -> iolist_to_binary([lists:join(<<"/">>, Parts)])
+    end,
+    serve_static_file(FileName, Req);
+
 handle_action(_, _, _Req) ->
     {error, 404, not_found}.
 
 %% Helper functions
+
+%% MIME types for static files
+mime_type(<<"html">>) -> <<"text/html">>;
+mime_type(<<"css">>) -> <<"text/css">>;
+mime_type(<<"js">>) -> <<"application/javascript">>;
+mime_type(<<"json">>) -> <<"application/json">>;
+mime_type(<<"png">>) -> <<"image/png">>;
+mime_type(<<"jpg">>) -> <<"image/jpeg">>;
+mime_type(<<"svg">>) -> <<"image/svg+xml">>;
+mime_type(<<"ico">>) -> <<"image/x-icon">>;
+mime_type(_) -> <<"application/octet-stream">>.
+
+get_extension(FileName) ->
+    case binary:split(FileName, <<".">>, [global]) of
+        Parts when length(Parts) > 1 -> lists:last(Parts);
+        _ -> <<>>
+    end.
+
+serve_static_file(FileName, _Req) ->
+    %% Get the priv directory path
+    PrivDir = code:priv_dir(coding_agent),
+    ViewerDir = filename:join([PrivDir, <<"session_viewer">>]),
+    FilePath = filename:join([ViewerDir, FileName]),
+    
+    case file:read_file(FilePath) of
+        {ok, Content} ->
+            Ext = get_extension(FileName),
+            ContentType = mime_type(Ext),
+            Headers = #{
+                <<"content-type">> => ContentType,
+                <<"cache-control">> => <<"max-age=3600">>
+            },
+            {ok, #{content => Content, headers => Headers}};
+        {error, enoent} ->
+            {error, 404, file_not_found};
+        {error, Reason} ->
+            {error, 500, io_lib:format("Error reading file: ~p", [Reason])}
+    end.
 
 get_memory_status() ->
     case ets:info(coding_agent_sessions) of
