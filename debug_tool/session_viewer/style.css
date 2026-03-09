@@ -137,6 +137,25 @@ h1 {
 }
 
 .sessions-container {
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+}
+
+.session-section {
+    margin-bottom: 10px;
+}
+
+.section-title {
+    font-size: 1.1rem;
+    margin-bottom: 15px;
+    color: #00d9ff;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sessions-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
     gap: 20px;
@@ -154,6 +173,14 @@ h1 {
     transform: translateY(-3px);
     border-color: rgba(0, 217, 255, 0.3);
     box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+}
+
+.session-card.active {
+    border-color: rgba(0, 255, 136, 0.3);
+}
+
+.session-card.saved {
+    border-color: rgba(136, 136, 136, 0.3);
 }
 
 .session-header {
@@ -192,6 +219,10 @@ h1 {
 .status-dot.busy {
     background: #ffaa00;
     animation: pulse 1s infinite;
+}
+
+.status-dot.saved {
+    background: #888;
 }
 
 @keyframes pulse {

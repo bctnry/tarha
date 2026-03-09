@@ -31,6 +31,7 @@ start_link(Options) ->
             {"/session/:id/busy", ?MODULE, #{action => session_busy}},
             {"/session/:id/save", ?MODULE, #{action => session_save}},
             {"/session/:id/load", ?MODULE, #{action => session_load}},
+            {"/session/:id/delete", ?MODULE, #{action => session_delete}},
             {"/sessions", ?MODULE, #{action => sessions_list}},
             {"/sessions/active", ?MODULE, #{action => active_sessions}},
             {"/memory", ?MODULE, #{action => memory}},
@@ -194,6 +195,13 @@ handle_action(<<"POST">>, session_load, Req) ->
     case coding_agent_session:load_session(SessionId) of
         {ok, {Id, _Pid}} -> {ok, #{session_id => Id, status => loaded}};
         {error, session_not_found} -> {error, 404, session_not_found};
+        {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
+    end;
+
+handle_action(<<"POST">>, session_delete, Req) ->
+    SessionId = cowboy_req:binding(id, Req),
+    case coding_agent_session:delete_saved_session(SessionId) of
+        ok -> {ok, #{session_id => SessionId, status => deleted}};
         {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
     end;
 

@@ -6,7 +6,7 @@
 -export([start_link/0, start_link/1, start_link/2, new/0, new/1, ask/2, ask/3]).
 -export([history/1, clear/1, stop_session/1, sessions/0]).
 -export([open_files/1, close_file/2, stats/1, ask_stream/3, compact/1]).
--export([save_session/1, load_session/1, list_saved_sessions/0]).
+-export([save_session/1, load_session/1, list_saved_sessions/0, delete_saved_session/1]).
 -export([set_context_length/2, get_context_length/1]).
 -export([halt/1, is_busy/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -1190,3 +1190,6 @@ load_session(SessionId) when is_binary(SessionId); is_list(SessionId) ->
 
 list_saved_sessions() ->
     coding_agent_session_store:list_sessions().
+
+delete_saved_session(SessionId) ->
+    coding_agent_session_store:delete_session(SessionId).

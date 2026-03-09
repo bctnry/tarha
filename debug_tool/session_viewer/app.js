@@ -4,7 +4,8 @@ class SessionViewer {
         this.apiUrl = document.getElementById('api-url').value || 'http://localhost:8080';
         this.autoRefresh = false;
         this.autoRefreshInterval = null;
-        this.sessions = [];
+        this.activeSessions = [];
+        this.savedSessions = [];
         this.selectedSession = null;
 
         this.init();
@@ -69,15 +70,21 @@ class SessionViewer {
         container.innerHTML = '<div class="loading">Loading sessions...</div>';
 
         try {
-            // Fetch active sessions
-            const sessionsData = await this.fetchJson('/sessions/active');
-            this.sessions = sessionsData.sessions || [];
+            // Fetch both active and saved sessions in parallel
+            const [activeData, savedData, statusData] = await Promise.all([
+                this.fetchJson('/sessions/active').catch(() => ({ sessions: [] })),
+                this.fetchJson('/sessions').catch(() => ({ sessions: [] })),
+                this.fetchJson('/status').catch(() => ({}))
+            ]);
 
-            // Fetch status for stats
-            const statusData = await this.fetchJson('/status');
+            this.activeSessions = activeData.sessions || [];
+            this.savedSessions = savedData.sessions || [];
+            
+            // Get active session IDs for comparison
+            const activeIds = new Set(this.activeSessions.map(s => s.id));
 
-            this.updateStats(this.sessions, statusData);
-            this.renderSessions(this.sessions);
+            this.updateStats(this.activeSessions, this.savedSessions, statusData);
+            this.renderSessions(this.activeSessions, this.savedSessions, activeIds);
 
             // Update last refreshed time
             document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
@@ -91,32 +98,51 @@ class SessionViewer {
         }
     }
 
-    updateStats(sessions, status) {
-        document.getElementById('total-sessions').textContent = sessions.length;
-        document.getElementById('active-sessions').textContent = status.active_sessions || sessions.length;
+    updateStats(activeSessions, savedSessions, status) {
+        document.getElementById('active-sessions').textContent = activeSessions.length;
+        document.getElementById('total-sessions').textContent = savedSessions.length;
     }
 
-    renderSessions(sessions) {
+    renderSessions(activeSessions, savedSessions, activeIds) {
         const container = document.getElementById('sessions-container');
 
-        if (sessions.length === 0) {
+        if (activeSessions.length === 0 && savedSessions.length === 0) {
             container.innerHTML = `
                 <div class="empty-state">
                     <div class="icon">📭</div>
-                    <p>No active sessions</p>
+                    <p>No sessions found</p>
                     <p style="margin-top: 10px; font-size: 0.9rem;">Sessions will appear here when created</p>
                 </div>
             `;
             return;
         }
 
-        container.innerHTML = sessions.map(session => this.renderSessionCard(session)).join('');
+        // Render active sessions first, then saved (non-active) sessions
+        let html = '';
+        
+        if (activeSessions.length > 0) {
+            html += '<div class="session-section"><h3 class="section-title">🟢 Active Sessions</h3>';
+            html += '<div class="sessions-grid">';
+            html += activeSessions.map(session => this.renderSessionCard(session, true)).join('');
+            html += '</div></div>';
+        }
+
+        // Saved sessions that are not currently active
+        const onlySaved = savedSessions.filter(s => !activeIds.has(s));
+        if (onlySaved.length > 0) {
+            html += '<div class="session-section"><h3 class="section-title">💾 Saved Sessions</h3>';
+            html += '<div class="sessions-grid">';
+            html += onlySaved.map(sessionId => this.renderSavedSessionCard(sessionId)).join('');
+            html += '</div></div>';
+        }
+
+        container.innerHTML = html;
 
         // Bind click events to session cards
         container.querySelectorAll('.session-card').forEach(card => {
             card.addEventListener('click', (e) => {
                 if (!e.target.closest('button')) {
-                    this.showSessionDetail(card.dataset.sessionId);
+                    this.showSessionDetail(card.dataset.sessionId, card.dataset.isActive === 'true');
                 }
             });
         });
@@ -132,66 +158,156 @@ class SessionViewer {
         container.querySelectorAll('.btn-stats').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                this.showSessionDetail(btn.dataset.sessionId);
+                this.showSessionDetail(btn.dataset.sessionId, true);
+            });
+        });
+
+        container.querySelectorAll('.btn-load').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.loadSession(btn.dataset.sessionId);
+            });
+        });
+
+        container.querySelectorAll('.btn-delete').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.deleteSession(btn.dataset.sessionId);
             });
         });
     }
 
-    renderSessionCard(session) {
+    renderSessionCard(session, isActive) {
         const sessionId = session.id || session;
         const isBusy = session.busy || false;
-        const model = session.model || 'unknown';
-        const tokens = session.prompt_tokens || session.estimated_tokens || 0;
-        const toolCalls = session.tool_calls || 0;
-        const messageCount = session.messages ? session.messages.length : 0;
-
+        const statusClass = isBusy ? 'busy' : 'idle';
+        const statusText = isBusy ? 'Busy' : 'Idle';
+        
         return `
-            <div class="session-card" data-session-id="${sessionId}">
+            <div class="session-card ${isActive ? 'active' : ''}" data-session-id="${this.escapeHtml(sessionId)}" data-is-active="${isActive}">
                 <div class="session-header">
-                    <span class="session-id">${sessionId.substring(0, 8)}...</span>
-                    <div class="session-status">
-                        <span class="status-dot ${isBusy ? 'busy' : 'idle'}"></span>
-                        <span>${isBusy ? 'Busy' : 'Idle'}</span>
-                    </div>
+                    <span class="session-id">${this.escapeHtml(this.truncateId(sessionId))}</span>
+                    <span class="session-status">
+                        <span class="status-dot ${statusClass}"></span>
+                        ${statusText}
+                    </span>
                 </div>
                 <div class="session-info">
                     <div class="info-row">
                         <span class="info-label">Model:</span>
-                        <span class="info-value model">${model}</span>
+                        <span class="info-value model">${this.escapeHtml(session.model || 'unknown')}</span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Messages:</span>
-                        <span class="info-value">${messageCount}</span>
+                        <span class="info-value">${session.message_count || session.messages || 0}</span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Tokens:</span>
-                        <span class="info-value tokens">${tokens.toLocaleString()}</span>
+                        <span class="info-value tokens">${this.formatTokens(session.total_tokens || session.tokens)}</span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Tool Calls:</span>
-                        <span class="info-value">${toolCalls}</span>
+                        <span class="info-value">${session.tool_calls || 0}</span>
                     </div>
                 </div>
                 <div class="session-actions">
-                    <button class="btn-secondary btn-stats" data-session-id="${sessionId}">📊 Stats</button>
-                    <button class="btn-danger btn-halt" data-session-id="${sessionId}">⏹ Halt</button>
+                    <button class="btn-secondary btn-stats" data-session-id="${this.escapeHtml(sessionId)}">Details</button>
+                    ${isActive ? `<button class="btn-danger btn-halt" data-session-id="${this.escapeHtml(sessionId)}">Halt</button>` : ''}
                 </div>
             </div>
         `;
     }
 
-    async showSessionDetail(sessionId) {
+    renderSavedSessionCard(sessionId) {
+        return `
+            <div class="session-card saved" data-session-id="${this.escapeHtml(sessionId)}" data-is-active="false">
+                <div class="session-header">
+                    <span class="session-id">${this.escapeHtml(this.truncateId(sessionId))}</span>
+                    <span class="session-status">
+                        <span class="status-dot saved"></span>
+                        Saved
+                    </span>
+                </div>
+                <div class="session-info">
+                    <div class="info-row">
+                        <span class="info-label">Status:</span>
+                        <span class="info-value">Not loaded</span>
+                    </div>
+                </div>
+                <div class="session-actions">
+                    <button class="btn-primary btn-load" data-session-id="${this.escapeHtml(sessionId)}">Load</button>
+                    <button class="btn-danger btn-delete" data-session-id="${this.escapeHtml(sessionId)}">Delete</button>
+                </div>
+            </div>
+        `;
+    }
+
+    async showSessionDetail(sessionId, isActive) {
         const detailPanel = document.getElementById('session-detail');
         const detailContent = document.getElementById('detail-content');
-
+        
         detailPanel.style.display = 'block';
         detailContent.innerHTML = '<div class="loading">Loading session details...</div>';
 
         try {
-            const sessionData = await this.fetchJson(`/session/${sessionId}`);
-            this.selectedSession = sessionData;
+            const data = await this.fetchJson(`/session/${sessionId}`);
+            this.selectedSession = sessionId;
 
-            detailContent.innerHTML = this.renderSessionDetail(sessionData);
+            let html = `
+                <div class="detail-section">
+                    <h3>Session Info</h3>
+                    <div class="info-row">
+                        <span class="info-label">ID:</span>
+                        <span class="info-value">${this.escapeHtml(sessionId)}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Model:</span>
+                        <span class="info-value model">${this.escapeHtml(data.model || 'unknown')}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Status:</span>
+                        <span class="info-value">${data.busy ? 'Busy' : 'Idle'}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Context Window:</span>
+                        <span class="info-value">${this.formatNumber(data.context_window || 0)}</span>
+                    </div>
+            `;
+
+            if (data.working_dir) {
+                html += `
+                    <div class="info-row">
+                        <span class="info-label">Working Dir:</span>
+                        <span class="info-value" style="font-size: 0.8rem; word-break: break-all;">${this.escapeHtml(data.working_dir)}</span>
+                    </div>
+                `;
+            }
+
+            html += '</div>';
+
+            if (data.open_files && data.open_files.length > 0) {
+                html += `
+                    <div class="detail-section">
+                        <h3>Open Files (${data.open_files.length})</h3>
+                        <ul class="files-list">
+                            ${data.open_files.map(f => `<li>${this.escapeHtml(f)}</li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            if (data.messages && data.messages.length > 0) {
+                html += `
+                    <div class="detail-section">
+                        <h3>Messages (${data.messages.length})</h3>
+                        <ul class="message-list">
+                            ${this.renderMessages(data.messages)}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            detailContent.innerHTML = html;
         } catch (error) {
             detailContent.innerHTML = `
                 <div class="error">
@@ -201,74 +317,23 @@ class SessionViewer {
         }
     }
 
-    renderSessionDetail(session) {
-        const id = session.id || 'unknown';
-        const model = session.model || 'unknown';
-        const messages = session.messages || [];
-        const workingDir = session.working_dir || 'unknown';
-        const promptTokens = session.prompt_tokens || 0;
-        const completionTokens = session.completion_tokens || 0;
-        const estimatedTokens = session.estimated_tokens || 0;
-        const toolCalls = session.tool_calls || 0;
-        const contextLength = session.context_length || 'unknown';
-        const openFiles = session.open_files || {};
-        const busy = session.busy || false;
-
-        let messagesHtml = '';
-        if (messages.length > 0) {
-            messagesHtml = messages.map(msg => `
+    renderMessages(messages) {
+        return messages.slice(-20).reverse().map(msg => {
+            const role = msg.role || 'unknown';
+            const content = msg.content || '';
+            const truncated = content.length > 500 ? content.substring(0, 500) + '...' : content;
+            
+            return `
                 <li class="message-item">
-                    <div class="message-role ${msg.role}">${msg.role}</div>
-                    <div class="message-content">${this.escapeHtml(msg.content || JSON.stringify(msg, null, 2))}</div>
+                    <div class="message-role ${role}">${this.escapeHtml(role)}</div>
+                    <div class="message-content">${this.escapeHtml(truncated)}</div>
                 </li>
-            `).join('');
-        } else {
-            messagesHtml = '<li class="message-item"><div class="message-content">No messages yet</div></li>';
-        }
-
-        return `
-            <div class="detail-section">
-                <h3>📋 Session ID</h3>
-                <pre>${id}</pre>
-            </div>
-
-            <div class="detail-section">
-                <h3>🤖 Model</h3>
-                <pre>${model}</pre>
-            </div>
-
-            <div class="detail-section">
-                <h3>📊 Statistics</h3>
-                <pre>
-Status:         ${busy ? 'Busy' : 'Idle'}
-Context Length: ${contextLength}
-Prompt Tokens:  ${promptTokens}
-Completion:     ${completionTokens}
-Estimated:      ${estimatedTokens}
-Tool Calls:     ${toolCalls}
-Messages:       ${messages.length}
-                </pre>
-            </div>
-
-            <div class="detail-section">
-                <h3>📁 Working Directory</h3>
-                <pre>${workingDir}</pre>
-            </div>
-
-            <div class="detail-section">
-                <h3>📂 Open Files (${Object.keys(openFiles).length})</h3>
-                <pre>${Object.keys(openFiles).length > 0 ? Object.keys(openFiles).join('\n') : 'No open files'}</pre>
-            </div>
-
-            <div class="detail-section">
-                <h3>💬 Messages (${messages.length})</h3>
-                <ul class="message-list">${messagesHtml}</ul>
-            </div>
-        `;
+            `;
+        }).join('');
     }
 
     async haltSession(sessionId) {
-        if (!confirm(`Are you sure you want to halt session ${sessionId.substring(0, 8)}...?`)) {
+        if (!confirm(`Are you sure you want to halt session ${this.truncateId(sessionId)}?`)) {
             return;
         }
 
@@ -277,6 +342,33 @@ Messages:       ${messages.length}
             await this.refresh();
         } catch (error) {
             alert(`Error halting session: ${error.message}`);
+        }
+    }
+
+    async loadSession(sessionId) {
+        if (!confirm(`Load session ${this.truncateId(sessionId)}?`)) {
+            return;
+        }
+
+        try {
+            const result = await this.postJson(`/session/${sessionId}/load`, {});
+            alert(`Session loaded: ${result.session_id}`);
+            await this.refresh();
+        } catch (error) {
+            alert(`Error loading session: ${error.message}`);
+        }
+    }
+
+    async deleteSession(sessionId) {
+        if (!confirm(`Delete saved session ${this.truncateId(sessionId)}? This cannot be undone.`)) {
+            return;
+        }
+
+        try {
+            await this.postJson(`/session/${sessionId}/delete`, {});
+            await this.refresh();
+        } catch (error) {
+            alert(`Error deleting session: ${error.message}`);
         }
     }
 
@@ -303,6 +395,22 @@ Messages:       ${messages.length}
                 this.autoRefreshInterval = null;
             }
         }
+    }
+
+    truncateId(id) {
+        if (!id) return 'unknown';
+        const str = String(id);
+        return str.length > 12 ? str.substring(0, 12) + '...' : str;
+    }
+
+    formatTokens(tokens) {
+        if (!tokens) return '0';
+        return this.formatNumber(tokens);
+    }
+
+    formatNumber(num) {
+        if (!num) return '0';
+        return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
     }
 
     escapeHtml(text) {
