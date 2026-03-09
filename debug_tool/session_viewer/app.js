@@ -30,6 +30,7 @@ class SessionViewer {
         try {
             const response = await fetch(url, {
                 method: 'GET',
+                mode: 'cors',
                 headers: {
                     'Accept': 'application/json'
                 }
@@ -39,6 +40,9 @@ class SessionViewer {
             }
             return await response.json();
         } catch (error) {
+            if (error.name === 'TypeError' && error.message.includes('Failed to fetch')) {
+                throw new Error(`CORS or network error: Cannot connect to ${this.apiUrl}. Make sure the server is running and CORS is enabled.`);
+            }
             console.error('Fetch error:', error);
             throw error;
         }
@@ -49,6 +53,7 @@ class SessionViewer {
         try {
             const response = await fetch(url, {
                 method: 'POST',
+                mode: 'cors',
                 headers: {
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
@@ -60,6 +65,9 @@ class SessionViewer {
             }
             return await response.json();
         } catch (error) {
+            if (error.name === 'TypeError' && error.message.includes('Failed to fetch')) {
+                throw new Error(`CORS or network error: Cannot connect to ${this.apiUrl}. Make sure the server is running and CORS is enabled.`);
+            }
             console.error('Post error:', error);
             throw error;
         }
@@ -78,7 +86,29 @@ class SessionViewer {
             ]);
 
             this.activeSessions = activeData.sessions || [];
-            this.savedSessions = savedData.sessions || [];
+            
+            // Handle both formats: session IDs as strings or objects
+            let savedSessions = savedData.sessions || [];
+            if (savedSessions.length > 0 && typeof savedSessions[0] === 'string') {
+                // Old API format: returns session IDs as strings
+                // Fetch details for each session
+                const sessionDetails = await Promise.all(
+                    savedSessions.slice(0, 50).map(id => 
+                        this.fetchJson(`/session/${id}`).catch(() => null)
+                    )
+                );
+                savedSessions = sessionDetails
+                    .filter(s => s && !s.error)
+                    .map(s => ({
+                        id: s.id,
+                        model: s.model || 'unknown',
+                        messages: s.message_count || s.messages || 0,
+                        total_tokens: s.total_tokens || 0,
+                        tool_calls: s.tool_calls || 0,
+                        working_dir: s.working_dir || ''
+                    }));
+            }
+            this.savedSessions = savedSessions;
             
             // Get active session IDs for comparison
             const activeIds = new Set(this.activeSessions.map(s => s.id));
@@ -128,11 +158,14 @@ class SessionViewer {
         }
 
         // Saved sessions that are not currently active
-        const onlySaved = savedSessions.filter(s => !activeIds.has(s));
+        const onlySaved = savedSessions.filter(s => {
+            const id = s.id || s;
+            return !activeIds.has(id);
+        });
         if (onlySaved.length > 0) {
             html += '<div class="session-section"><h3 class="section-title">💾 Saved Sessions</h3>';
             html += '<div class="sessions-grid">';
-            html += onlySaved.map(sessionId => this.renderSavedSessionCard(sessionId)).join('');
+            html += onlySaved.map(session => this.renderSavedSessionCard(session)).join('');
             html += '</div></div>';
         }
 
@@ -218,7 +251,13 @@ class SessionViewer {
         `;
     }
 
-    renderSavedSessionCard(sessionId) {
+    renderSavedSessionCard(session) {
+        const sessionId = session.id || session;
+        const model = session.model || 'unknown';
+        const messages = session.messages || 0;
+        const tokens = session.total_tokens || session.prompt_tokens || 0;
+        const toolCalls = session.tool_calls || 0;
+        
         return `
             <div class="session-card saved" data-session-id="${this.escapeHtml(sessionId)}" data-is-active="false">
                 <div class="session-header">
@@ -230,8 +269,20 @@ class SessionViewer {
                 </div>
                 <div class="session-info">
                     <div class="info-row">
-                        <span class="info-label">Status:</span>
-                        <span class="info-value">Not loaded</span>
+                        <span class="info-label">Model:</span>
+                        <span class="info-value model">${this.escapeHtml(model)}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Messages:</span>
+                        <span class="info-value">${messages}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Tokens:</span>
+                        <span class="info-value tokens">${this.formatTokens(tokens)}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Tool Calls:</span>
+                        <span class="info-value">${toolCalls}</span>
                     </div>
                 </div>
                 <div class="session-actions">

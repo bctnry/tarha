@@ -13,24 +13,27 @@ A web-based debug tool for viewing and managing coding agent sessions.
 
 ## Usage
 
-### Start the Coding Agent HTTP Server
+### Step 1: Start the Coding Agent HTTP Server
 
 ```bash
 ./coder-http 8080
 ```
 
-### Open the Session Viewer
+### Step 2: Open the Session Viewer
 
-Open `index.html` in your browser:
-
+**Option A - Using the included serve.py (Recommended for CORS):**
 ```bash
-# Using Python
-python3 -m http.server 3000 --directory debug_tool/session_viewer
-
-# Then open http://localhost:3000
+python3 debug_tool/session_viewer/serve.py 3000
 ```
+Then open: http://localhost:3000
 
-Or simply open the file directly:
+**Option B - Using Python's built-in http.server:**
+```bash
+python3 -m http.server 3000 --directory debug_tool/session_viewer
+```
+Then open: http://localhost:3000
+
+**Option C - Open directly in browser:**
 ```bash
 # Linux
 xdg-open debug_tool/session_viewer/index.html
@@ -42,6 +45,45 @@ open debug_tool/session_viewer/index.html
 start debug_tool/session_viewer/index.html
 ```
 
+## CORS Troubleshooting
+
+If you see CORS errors in your browser console, try these solutions:
+
+### 1. Use the included serve.py script
+
+The `serve.py` script includes proper CORS headers:
+```bash
+python3 debug_tool/session_viewer/serve.py 3000
+```
+
+### 2. The coding-agent HTTP server already has CORS enabled
+
+The backend server (`coder-http`) includes these CORS headers:
+- `Access-Control-Allow-Origin: *`
+- `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
+- `Access-Control-Allow-Headers: Content-Type, Authorization, Accept, X-Requested-With, Origin, Cache-Control`
+- `Access-Control-Max-Age: 86400`
+
+### 3. Common CORS issues
+
+| Error | Solution |
+|-------|----------|
+| "Failed to fetch" | Make sure the HTTP server is running (`./coder-http 8080`) |
+| "CORS policy blocked" | Use `serve.py` or ensure both servers are on localhost |
+| "Network error" | Check if the API URL is correct in the UI |
+
+### 4. Verify CORS is working
+
+```bash
+# Test CORS preflight request
+curl -X OPTIONS -i http://localhost:8080/sessions
+# Should see: Access-Control-Allow-Origin: *
+
+# Test a GET request
+curl -i http://localhost:8080/sessions
+# Should see CORS headers in response
+```
+
 ## API Endpoints Used
 
 The session viewer connects to these HTTP API endpoints:
@@ -49,9 +91,11 @@ The session viewer connects to these HTTP API endpoints:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/sessions` | GET | List all sessions |
+| `/sessions/active` | GET | List active sessions |
 | `/status` | GET | Get agent status |
 | `/session/:id` | GET | Get session details |
 | `/session/:id/halt` | POST | Halt a session |
+| `/session/:id/load` | POST | Load a saved session |
 
 ## Configuration
 
@@ -90,6 +134,7 @@ session_viewer/
 ├── index.html    # Main HTML structure
 ├── style.css     # Styling
 ├── app.js        # Application logic
+├── serve.py      # Python server with CORS headers
 └── README.md     # This file
 ```
 

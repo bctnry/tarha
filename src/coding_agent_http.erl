@@ -7,8 +7,10 @@
 
 -define(CORS_HEADERS, #{
     <<"access-control-allow-origin">> => <<"*">>,
-    <<"access-control-allow-methods">> => <<"GET, POST, OPTIONS">>,
-    <<"access-control-allow-headers">> => <<"Content-Type, Authorization">>
+    <<"access-control-allow-methods">> => <<"GET, POST, PUT, DELETE, OPTIONS">>,
+    <<"access-control-allow-headers">> => <<"Content-Type, Authorization, Accept, X-Requested-With, Origin, Cache-Control">>,
+    <<"access-control-expose-headers">> => <<"Content-Type, Content-Length, X-Request-Id">>,
+    <<"access-control-max-age">> => <<"86400">>
 }).
 
 start_link() ->
@@ -207,7 +209,29 @@ handle_action(<<"POST">>, session_delete, Req) ->
 
 handle_action(<<"GET">>, sessions_list, _Req) ->
     case coding_agent_session:list_saved_sessions() of
-        {ok, SessionIds} -> {ok, #{sessions => SessionIds, count => length(SessionIds)}};
+        {ok, SessionIds} ->
+            %% Load each session's summary info
+            Sessions = lists:filtermap(fun(SessionId) ->
+                SessionIdBin = if is_binary(SessionId) -> SessionId; true -> iolist_to_binary(SessionId) end,
+                case coding_agent_session_store:load_session(SessionIdBin) of
+                    {ok, Data} ->
+                        %% Extract summary info
+                        Summary = #{
+                            id => SessionIdBin,
+                            model => maps:get(<<"model">>, Data, <<"unknown">>),
+                            messages => length(maps:get(<<"messages">>, Data, [])),
+                            prompt_tokens => maps:get(<<"prompt_tokens">>, Data, 0),
+                            completion_tokens => maps:get(<<"completion_tokens">>, Data, 0),
+                            total_tokens => maps:get(<<"total_tokens">>, Data, 0),
+                            tool_calls => maps:get(<<"tool_calls">>, Data, 0),
+                            working_dir => maps:get(<<"working_dir">>, Data, <<"">>),
+                            status => <<"saved">>
+                        },
+                        {true, Summary};
+                    {error, _} -> false
+                end
+            end, SessionIds),
+            {ok, #{sessions => Sessions, count => length(Sessions)}};
         {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
     end;
 
@@ -379,9 +403,31 @@ get_session_count() ->
     end.
 
 get_session_status(SessionId) when is_binary(SessionId) ->
+    %% First check if it's an active session
     case coding_agent_session:stats(SessionId) of
-        {ok, Stats} -> {ok, Stats};
-        {error, not_found} -> {error, 404, session_not_found};
+        {ok, Stats} -> 
+            {ok, Stats#{status => <<"active">>}};
+        {error, not_found} ->
+            %% Not active, check if it's a saved session
+            case coding_agent_session_store:load_session(SessionId) of
+                {ok, Data} ->
+                    %% Extract summary info from saved session
+                    Summary = #{
+                        id => SessionId,
+                        model => maps:get(<<"model">>, Data, <<"unknown">>),
+                        message_count => length(maps:get(<<"messages">>, Data, [])),
+                        messages => maps:get(<<"messages">>, Data, []),
+                        prompt_tokens => maps:get(<<"prompt_tokens">>, Data, 0),
+                        completion_tokens => maps:get(<<"completion_tokens">>, Data, 0),
+                        total_tokens => maps:get(<<"total_tokens">>, Data, 0),
+                        tool_calls => maps:get(<<"tool_calls">>, Data, 0),
+                        working_dir => maps:get(<<"working_dir">>, Data, <<>>),
+                        status => <<"saved">>
+                    },
+                    {ok, Summary};
+                {error, _} ->
+                    {error, 404, session_not_found}
+            end;
         {error, Reason} -> {error, 500, io_lib:format("Error: ~p", [Reason])}
     end.
 
