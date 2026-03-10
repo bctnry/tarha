@@ -67,7 +67,6 @@ do_with_retry(Fun, RetryCount) ->
             ReasonBin = iolist_to_binary(io_lib:format("~p", [Reason])),
             IsTransient = binary:match(ReasonBin, <<"connrefused">>) =/= nomatch
                 orelse binary:match(ReasonBin, <<"nxdomain">>) =/= nomatch
-                orelse binary:match(ReasonBin, <<"timeout">>) =/= nomatch
                 orelse binary:match(ReasonBin, <<"closed">>) =/= nomatch
                 orelse binary:match(ReasonBin, <<"econnreset">>) =/= nomatch,
             case IsTransient of

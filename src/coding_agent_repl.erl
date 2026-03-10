@@ -227,6 +227,7 @@ process_command(SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(R
     io:format("  /save           - Save current session~n"),
     io:format("  /clear          - Clear session history~n"),
     io:format("  /trim           - Force memory cleanup~n"),
+    io:format("  /cancel         - Cancel in-progress operation~n"),
     io:format("  /crashes        - Show recent crashes~n"),
     io:format("  /reports        - List crash/fix reports~n"),
     io:format("  /fix <id>       - Attempt auto-fix~n"),
@@ -332,6 +333,15 @@ process_command(SessionId, History, "tools" ++ Rest, Mode) when Rest =:= []; hd(
         io:format("  - ~s~n", [Name])
     end, Tools),
     io:format("~n"),
+    {continue, History, Mode};
+
+process_command(SessionId, History, "cancel", Mode) ->
+    case coding_agent_request_registry:halt(SessionId) of
+        ok ->
+            io:format("~n✓ Request cancelled.~n~n");
+        {error, not_found} ->
+            io:format("~nNo active request to cancel.~n~n")
+    end,
     {continue, History, Mode};
 
 process_command(_SessionId, History, "models" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
@@ -890,13 +900,31 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
             {ok, {NewSessionId, _}} = coding_agent_session:new(),
             io:format("New session: ~s~n~n", [NewSessionId]),
             process_message(NewSessionId, NewHistory, Input, Mode, 0);
+        {error, max_retries_exceeded} ->
+            io:format("~n✗ Max retries exceeded. The request failed multiple times.~n"),
+            io:format("  This usually means:~n"),
+            io:format("  - Model is overloaded or slow~n"),
+            io:format("  - Context is too long (use /trim to reduce)~n"),
+            io:format("  - Network issue to Ollama/cloud~n~n"),
+            {continue, History, Mode};
+        {error, {http_error, Status, Body}} ->
+            io:format("~n✗ HTTP Error ~p: ~s~n~n", [Status, binary:part(Body, 0, min(200, byte_size(Body)))]),
+            {continue, History, Mode};
         {error, Reason} ->
-            io:format("Error: ~p~n~n", [Reason]),
+            io:format("~n✗ Error: ~p~n~n", [Reason]),
             report_error(Reason, SessionId),
-            {continue, NewHistory, Mode}
+            {continue, History, Mode}
     catch
+        exit:{timeout, {gen_server,call,[Pid, Call, Timeout]}} ->
+            io:format("~n✗ Request timed out after ~pms~n", [Timeout]),
+            io:format("  Called: ~p~n", [element(1, Call)]),
+            io:format("  Retrying (~p/3)...~n~n", [RetryCount + 1]),
+            timer:sleep(1000 * (RetryCount + 1)),
+            process_message(SessionId, History, Input, Mode, RetryCount + 1);
         exit:{timeout, _} ->
-            io:format("~nRequest timed out. Retrying (~p/3)...~n", [RetryCount + 1]),
+            io:format("~n✗ Request timed out (gen_server call)~n"),
+            io:format("  This usually means the model is processing slowly or context is too long.~n"),
+            io:format("  Retrying (~p/3)...~n~n", [RetryCount + 1]),
             timer:sleep(1000 * (RetryCount + 1)),
             process_message(SessionId, History, Input, Mode, RetryCount + 1);
         error:undef:Stacktrace ->

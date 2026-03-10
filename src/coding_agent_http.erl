@@ -246,8 +246,8 @@ handle_action(<<"GET">>, active_sessions, _Req) ->
     Sessions = coding_agent_session:sessions(),
     SessionList = lists:map(fun({Id, Pid}) ->
         case coding_agent_session:stats(Id) of
-            {ok, Stats} -> Stats#{pid => pid_to_list(Pid)};
-            {error, _} -> #{id => Id, pid => pid_to_list(Pid)}
+            {ok, Stats} -> Stats#{<<"id">> => Id, <<"pid">> => pid_to_list(Pid)};
+            {error, _} -> #{<<"id">> => Id, <<"pid">> => pid_to_list(Pid)}
         end
     end, Sessions),
     {ok, #{sessions => SessionList, count => length(SessionList)}};
@@ -430,10 +430,11 @@ serve_static_file(FileName, _Req) ->
         {ok, Content} ->
             Ext = get_extension(FileName),
             ContentType = mime_type(Ext),
-            Headers = #{
+            %% Include CORS headers for cross-origin requests
+            Headers = maps:merge(?CORS_HEADERS, #{
                 <<"content-type">> => ContentType,
                 <<"cache-control">> => <<"max-age=3600">>
-            },
+            }),
             {ok, #{content => Content, headers => Headers}};
         {error, enoent} ->
             {error, 404, file_not_found};
