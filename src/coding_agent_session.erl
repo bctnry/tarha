@@ -30,6 +30,7 @@
 -define(MAX_HISTORY_SIZE, 100000).  % 100KB max history in bytes
 -define(MAX_TOOL_RESULT_SIZE, 50000).  % 50KB max per tool result - increased to avoid re-reads
 -define(MAX_TOTAL_RESULTS, 100000).     % 100KB total for all results in one turn
+-define(MAX_TOOL_MESSAGES, 10).         % Max tool messages to keep in history
 -define(DEFAULT_CONTEXT_LENGTH, 32768).  % Default if model info unavailable
 -define(CONTEXT_USAGE_THRESHOLD, 0.85).  % Compact at 85% context usage
 -define(COMPACTION_THRESHOLD, 150000).  % ~50KB tokens
@@ -663,7 +664,9 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
 handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration, OpenFiles, TokenInfo, _SessionId) when Content =/= <<>>, Content =/= nil ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     AssistantMsg = #{<<"role">> => <<"assistant">>, <<"content">> => Content},
-    NewHistory = Messages ++ [AssistantMsg],
+    RawHistory = Messages ++ [AssistantMsg],
+    % Prune old tool messages to save context
+    NewHistory = prune_tool_messages(RawHistory, ?MAX_TOOL_MESSAGES),
     {ok, Content, Thinking, NewHistory, OpenFiles, TokenInfo};
 
 handle_response(_Model, _Messages, _ResponseMsg, _Iteration, _OpenFiles, _TokenInfo, _SessionId) ->
@@ -746,6 +749,82 @@ smart_truncate(Content, MaxSize) ->
         _ ->
             <<Content/binary, " ... (truncated)">>
     end.
+
+%% Prune old tool messages to reduce context size
+%% Keeps only the most recent N tool-related messages
+prune_tool_messages(Messages, MaxToolMessages) when length(Messages) =< MaxToolMessages * 3 ->
+    Messages;
+prune_tool_messages(Messages, MaxToolMessages) ->
+    % Count tool-related messages (assistant with tool_calls + tool messages)
+    ToolMsgCount = count_tool_messages(Messages),
+    case ToolMsgCount =< MaxToolMessages of
+        true -> Messages;
+        false ->
+            % Summarize old tool interactions
+            {OldPart, RecentPart} = split_for_pruning(Messages, MaxToolMessages),
+            case OldPart of
+                [] -> RecentPart;
+                _ ->
+                    Summary = summarize_tool_interactions(OldPart),
+                    [Summary | RecentPart]
+            end
+    end.
+
+count_tool_messages(Messages) ->
+    lists:foldl(fun(Msg, Acc) ->
+        case Msg of
+            #{<<"role">> := <<"tool">>} -> Acc + 1;
+            #{<<"role">> := <<"assistant">>, <<"tool_calls">> := _} -> Acc + 1;
+            _ -> Acc
+        end
+    end, 0, Messages).
+
+split_for_pruning(Messages, MaxKeep) ->
+    % Keep recent messages, summarize older ones
+    ReverseMsgs = lists:reverse(Messages),
+    {KeepRecent, ToSummarize} = split_messages_counting(ReverseMsgs, MaxKeep, [], []),
+    {lists:reverse(ToSummarize), lists:reverse(KeepRecent)}.
+
+split_messages_counting([], _Max, Keep, Summarize) ->
+    {Keep, Summarize};
+split_messages_counting([Msg | Rest], Max, Keep, Summarize) when length(Keep) >= Max ->
+    split_messages_counting(Rest, Max, Keep, [Msg | Summarize]);
+split_messages_counting([Msg | Rest], Max, Keep, Summarize) ->
+    split_messages_counting(Rest, Max, [Msg | Keep], Summarize).
+
+summarize_tool_interactions(Messages) ->
+    ToolOps = lists:filtermap(fun(Msg) ->
+        case Msg of
+            #{<<"role">> := <<"assistant">>, <<"tool_calls">> := Calls} ->
+                ToolNames = [maps:get(<<"name">>, maps:get(<<"function">>, TC, #{}), <<"unknown">>) 
+                            || TC <- Calls],
+                {true, ToolNames};
+            _ -> false
+        end
+    end, Messages),
+    AllTools = lists:concat(ToolOps),
+    ToolCounts = count_tool_usage(AllTools),
+    
+    SummaryBin = iolist_to_binary([
+        <<"[Previous tool operations: ">>,
+        string:join([format_tool_count(Name, Count) || {Name, Count} <- ToolCounts], ", "),
+        <<"]">>
+    ]),
+    #{
+        <<"role">> => <<"system">>,
+        <<"content">> => SummaryBin
+    }.
+
+count_tool_usage(Tools) ->
+    lists:foldl(fun(Tool, Acc) ->
+        case lists:keyfind(Tool, 1, Acc) of
+            {Tool, Count} -> lists:keyreplace(Tool, 1, Acc, {Tool, Count + 1});
+            false -> [{Tool, 1} | Acc]
+        end
+    end, [], Tools).
+
+format_tool_count(Name, Count) ->
+    io_lib:format("~s(x~p)", [Name, Count]).
 
 execute_single_tool_with_retry(TC, OpenFiles) ->
     execute_single_tool_with_retry(TC, OpenFiles, 0).
