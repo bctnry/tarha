@@ -191,13 +191,6 @@ class SessionViewer {
             });
         });
 
-        container.querySelectorAll('.btn-load').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.loadSession(btn.dataset.sessionId);
-            });
-        });
-
         container.querySelectorAll('.btn-delete').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -282,7 +275,7 @@ class SessionViewer {
                     </div>
                 </div>
                 <div class="session-actions">
-                    <button class="btn-primary btn-load" data-session-id="${this.escapeHtml(sessionId)}">Load</button>
+                    <button class="btn-secondary btn-stats" data-session-id="${this.escapeHtml(sessionId)}">Details</button>
                     <button class="btn-danger btn-delete" data-session-id="${this.escapeHtml(sessionId)}">Delete</button>
                 </div>
             </div>
@@ -365,18 +358,42 @@ class SessionViewer {
     }
 
     renderMessages(messages) {
-        return messages.slice(-20).reverse().map(msg => {
+        // Show all messages in chronological order (oldest first)
+        const allMessages = messages || [];
+        
+        return allMessages.map((msg, idx) => {
             const role = msg.role || 'unknown';
             const content = msg.content || '';
-            const truncated = content.length > 500 ? content.substring(0, 500) + '...' : content;
+            // Show full content with pre-wrap for formatting
+            const formattedContent = this.formatMessageContent(content);
             
             return `
-                <li class="message-item">
+                <li class="message-item" data-index="${idx}">
                     <div class="message-role ${role}">${this.escapeHtml(role)}</div>
-                    <div class="message-content">${this.escapeHtml(truncated)}</div>
+                    <div class="message-content">${formattedContent}</div>
                 </li>
             `;
         }).join('');
+    }
+
+    formatMessageContent(content) {
+        // Handle content that might be string or array of content parts
+        if (Array.isArray(content)) {
+            return content.map(part => {
+                if (typeof part === 'string') {
+                    return this.escapeHtml(part);
+                } else if (part.text) {
+                    return this.escapeHtml(part.text);
+                } else if (part.type === 'tool_call') {
+                    return `<div class="tool-call">${this.escapeHtml(JSON.stringify(part, null, 2))}</div>`;
+                } else if (part.type === 'tool_result') {
+                    return `<div class="tool-result">${this.escapeHtml(JSON.stringify(part, null, 2))}</div>`;
+                }
+                return this.escapeHtml(JSON.stringify(part, null, 2));
+            }).join('');
+        }
+        // Full content without truncation, preserve whitespace
+        return `<pre class="message-text">${this.escapeHtml(content)}</pre>`;
     }
 
     async haltSession(sessionId) {
@@ -389,20 +406,6 @@ class SessionViewer {
             await this.refresh();
         } catch (error) {
             alert(`Error halting session: ${error.message}`);
-        }
-    }
-
-    async loadSession(sessionId) {
-        if (!confirm(`Load session ${this.truncateId(sessionId)}?`)) {
-            return;
-        }
-
-        try {
-            const result = await this.postJson(`/session/${sessionId}/load`, {});
-            alert(`Session loaded: ${result.session_id}`);
-            await this.refresh();
-        } catch (error) {
-            alert(`Error loading session: ${error.message}`);
         }
     }
 

@@ -365,10 +365,36 @@ h1 {
 .message-content {
     font-size: 0.9rem;
     line-height: 1.5;
+    word-break: break-word;
+}
+
+.message-text {
+    background: rgba(0, 0, 0, 0.2);
+    padding: 10px;
+    border-radius: 6px;
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 300px;
+    margin: 0;
+    font-family: 'Courier New', Consolas, monospace;
+    font-size: 0.85rem;
+    max-height: 400px;
     overflow-y: auto;
+}
+
+.tool-call, .tool-result {
+    background: rgba(255, 136, 0, 0.1);
+    padding: 10px;
+    border-radius: 6px;
+    margin: 8px 0;
+    border-left: 3px solid #ff8800;
+    font-family: 'Courier New', Consolas, monospace;
+    font-size: 0.8rem;
+    overflow-x: auto;
+}
+
+.tool-result {
+    background: rgba(0, 255, 136, 0.1);
+    border-left-color: #00ff88;
 }
 
 .detail-section {
