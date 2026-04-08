@@ -9,11 +9,23 @@ src/
 ├── coding_agent.app.src          # App config
 ├── coding_agent_app.erl          # Application module
 ├── coding_agent_sup.erl          # Supervisor
+├── coding_agent_config.erl       # Centralized config (model, host, etc.)
 ├── coding_agent_ollama.erl       # Ollama API client
-├── coding_agent_tools.erl        # 30+ tools (read_file, write_file, etc.)
+├── coding_agent_tools.erl        # Tool dispatcher (delegates to sub-modules)
+├── coding_agent_tools_build.erl  # Build/test/lint tools
+├── coding_agent_tools_command.erl# Shell command & HTTP tools
+├── coding_agent_tools_file.erl   # File operation tools
+├── coding_agent_tools_git.erl    # Git operation tools
+├── coding_agent_tools_model.erl  # Model management tools
+├── coding_agent_tools_refactor.erl# Smart commit, merge, review tools
+├── coding_agent_tools_search.erl # Grep/find search tools
+├── coding_agent_tools_self.erl   # Self-modification & checkpoint tools
+├── coding_agent_tools_skills.erl # Skills listing & loading tools
+├── coding_agent_tools_undo.erl   # Undo/redo & backup tools
 ├── coding_agent.erl              # Single-shot agent
 ├── coding_agent_session_sup.erl  # Session supervisor
 ├── coding_agent_session.erl      # Conversational session
+├── coding_agent_session_store.erl# Session persistence
 ├── coding_agent_self.erl         # Self-modification, checkpoints
 ├── coding_agent_healer.erl       # Crash analysis, auto-fix
 ├── coding_agent_process_monitor.erl # Process monitoring, GC, crash tracking
@@ -21,11 +33,15 @@ src/
 ├── coding_agent_skills.erl       # Skills loader (workspace + builtin)
 ├── coding_agent_repl.erl         # Interactive REPL
 ├── coding_agent_cli.erl          # CLI interface
-└── coding_agent_config.erl       # Config loader
+├── coding_agent_undo.erl         # Undo stack manager
+├── coding_agent_request_registry.erl # Request tracking
+├── coding_agent_stream.erl       # Streaming response handler
+├── coding_agent_lsp.erl          # LSP client
+└── coding_agent_index.erl        # Code index
 
 priv/
-└── skills/
-    └── example/SKILL.md          # Example builtin skill
+├── skills/
+│   └── example/SKILL.md          # Example builtin skill
 
 skills/                           # Workspace skills (user-defined)
 └── my-skill/SKILL.md
@@ -34,7 +50,8 @@ memory/
 ├── MEMORY.md                     # Long-term memory (facts, preferences)
 └── HISTORY.md                    # Grep-searchable conversation history
 
-config.yaml                        # Example configuration
+config.example.yaml               # Documented config template
+config.yaml                        # User configuration (gitignored)
 coder                              # REPL launcher script
 rebar.config                       # Dependencies: hackney, jsx
 ```
@@ -71,18 +88,26 @@ Set the model via environment variable:
 OLLAMA_MODEL=glm-5:cloud ./coder
 ```
 
-Or in `config.yaml`:
+Or in `config.yaml` (see `config.example.yaml` for all options):
 ```yaml
 ollama:
   model: glm-5:cloud
   host: http://localhost:11434
 ```
 
+Configuration is centralized in `coding_agent_config` module, which provides:
+- `coding_agent_config:model/0` — current model name
+- `coding_agent_config:ollama_host/0` — Ollama API host
+- `coding_agent_config:max_iterations/0` — agent loop limit
+- `coding_agent_config:sessions_dir/0` — session storage path
+- `coding_agent_config:set_model/1` — switch model at runtime
+
 ## Architecture Notes
 
 - Sessions stored in ETS table `coding_agent_sessions`
 - Conversational memory stored in `memory/MEMORY.md` and `memory/HISTORY.md`
 - Tool calling requires `think: true` flag in Ollama API
+- `coding_agent_tools` dispatches tool calls to sub-modules (file, git, search, etc.)
 
 ## IMPORTANT
 

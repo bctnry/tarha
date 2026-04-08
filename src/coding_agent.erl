@@ -1,15 +1,15 @@
 -module(coding_agent).
 -behaviour(gen_server).
 
--export([start_link/0, run/1, run/2, stop/0]).
+-export([start_link/0, run/1, run/2, stop/0, ask/1, ask/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -record(state, {
-    model :: binary(),
-    messages :: list()
+    model :: binary()
 }).
 
 -define(MAX_ITERATIONS, 50).
+
 -define(SYSTEM_PROMPT, <<"You are a coding assistant with access to tools. Use the tools to help the user.
 Think carefully before acting. Plan your approach, then execute.
 When you have completed the task, respond with your final answer.
@@ -23,6 +23,10 @@ Available tools:
 Always use absolute paths when reading or writing files.
 Be careful with run_command - only use it when necessary.">>).
 
+%%===================================================================
+%% API — Single-shot agent (backwards compatible)
+%%===================================================================
+
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -35,10 +39,33 @@ run(Task, Opts) ->
 stop() ->
     gen_server:stop(?MODULE).
 
+%%===================================================================
+%% Convenience API — Ephemeral session wrapper
+%%===================================================================
+
+ask(Question) ->
+    ask(Question, #{}).
+
+ask(Question, Opts) ->
+    EphemeralOpts = Opts#{ephemeral => true},
+    case coding_agent_session:new(<<>>, EphemeralOpts) of
+        {ok, {SessionId, _Pid}} ->
+            Result = coding_agent_session:ask(SessionId, Question),
+            case coding_agent_session:clear(SessionId) of
+                _ -> ok
+            end,
+            Result;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%%===================================================================
+%% gen_server callbacks (legacy single-shot mode)
+%%===================================================================
+
 init([]) ->
-    Model0 = application:get_env(coding_agent, model, <<"glm-5:cloud">>),
-    Model = if is_list(Model0) -> list_to_binary(Model0); true -> Model0 end,
-    {ok, #state{model = Model, messages = []}}.
+    Model = coding_agent_config:model(),
+    {ok, #state{model = Model}}.
 
 handle_call({run, Task, _Opts}, _From, State = #state{model = Model}) ->
     TaskBin = iolist_to_binary(Task),
@@ -84,7 +111,14 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
     },
     UpdatedMessages = Messages ++ [AssistantMsg],
     ToolResults = execute_tool_calls(ToolCalls),
-    ToolMsg = #{<<"role">> => <<"tool">>, <<"content">> => ToolResults},
+    SummarizedResults = coding_agent_tools:clean_output(iolist_to_binary(io_lib:format("~p", [ToolResults]))),
+    ResultBin = case byte_size(SummarizedResults) of
+        Size when Size > 50000 ->
+            <<Short:50000/binary, _/binary>> = SummarizedResults,
+            <<Short/binary, "... (truncated)">>;
+        _ -> SummarizedResults
+    end,
+    ToolMsg = #{<<"role">> => <<"tool">>, <<"content">> => ResultBin},
     MessagesWithResults = UpdatedMessages ++ [ToolMsg],
     case run_agent_loop(Model, MessagesWithResults, Iteration + 1) of
         {ok, Response, NewThinking} ->
@@ -105,8 +139,7 @@ handle_response(_Model, _Messages, _ResponseMsg, _Iteration) ->
     {error, unexpected_response}.
 
 execute_tool_calls(ToolCalls) when is_list(ToolCalls) ->
-    Results = [execute_single_tool(TC) || TC <- ToolCalls],
-    list_to_binary(io_lib:format("~p", [Results])).
+    [execute_single_tool(TC) || TC <- ToolCalls].
 
 execute_single_tool(#{<<"function">> := #{<<"name">> := Name, <<"arguments">> := Args}}) ->
     Result = coding_agent_tools:execute(Name, Args),

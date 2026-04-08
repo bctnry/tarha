@@ -14,6 +14,11 @@ stop_session(Pid) ->
     supervisor:terminate_child(?MODULE, Pid).
 
 init([]) ->
+    %% Ensure ETS table exists (survives app restart)
+    case ets:whereis(coding_agent_sessions) of
+        undefined -> ets:new(coding_agent_sessions, [named_table, public, set]);
+        _ -> ok
+    end,
     SessionSpec = #{
         id => coding_agent_session,
         start => {coding_agent_session, start_link, []},

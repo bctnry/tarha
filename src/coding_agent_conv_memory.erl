@@ -6,6 +6,8 @@
 -export([consolidate/0, consolidate/1, should_consolidate/0, set_window/1]).
 -export([list_detail_files/0, get_detail_file/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([truncate_memory/2, build_consolidation_prompt/2, build_detail_content/2]).
+-export([format_timestamp/1, format_timestamp_file/1, role_to_binary/1]).
 
 -record(state, {
     workspace :: string(),
@@ -358,8 +360,6 @@ role_to_binary(R) -> iolist_to_binary(io_lib:format("~p", [R])).
 
 call_llm_for_consolidation(Prompt) ->
     Model = application:get_env(coding_agent, model, <<"glm-5:cloud">>),
-    OllamaHost = application:get_env(coding_agent, ollama_host, "http://localhost:11434"),
-    
     ConsolidateTool = #{
         <<"type">> => <<"function">>,
         <<"function">> => #{
@@ -387,7 +387,7 @@ call_llm_for_consolidation(Prompt) ->
         #{<<"role">> => <<"user">>, <<"content">> => Prompt}
     ],
     
-    case coding_agent_ollama:chat(#{messages => Messages, model => Model, tools => [ConsolidateTool], host => OllamaHost}) of
+    case coding_agent_ollama:chat_with_tools(Model, Messages, [ConsolidateTool]) of
         {ok, #{<<"tool_calls">> := [ToolCall | _]}} ->
             Args = maps:get(<<"arguments">>, ToolCall, #{}),
             {ok, Args};

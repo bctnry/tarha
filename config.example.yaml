@@ -1,0 +1,20 @@
+# Tarha Coding Agent Configuration
+# Copy this file to config.yaml and customize.
+# Values here override defaults in coding_agent_config.erl.
+# Note: config.yaml is not auto-loaded by the application.
+# Set env vars or sys.config entries to apply these values.
+
+ollama:
+  model: glm-5:cloud
+  host: http://localhost:11434
+
+agent:
+  max_iterations: 100
+  workspace: .
+
+memory:
+  max_size: 10000
+  consolidate_threshold: 20
+
+session:
+  max_messages: 100

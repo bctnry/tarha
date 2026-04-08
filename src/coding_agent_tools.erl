@@ -6,6 +6,13 @@
 -export([get_log/0, clear_log/0]).
 -export([start_lsp/1, start_index/1]).
 -export([safe_binary/1, safe_binary/2]).
+-export([sanitize_path/1, find_occurrences/2, replace_all/3]).
+-export([contains_merge_conflict/1, resolve_conflicts/2, resolve_conflicts_with_strategy/2]).
+-export([detect_change_type/1, analyze_diff/1, detect_issues/1, generate_suggestions/1]).
+-export([format_undo_results/1, limit_grep_output/2, clean_output/1]).
+%% New exports for sub-module access
+-export([run_command_impl/3, resolve_conflicts_in_file/2]).
+-export([report_progress/3, log_operation/3, safety_check/2]).
 -include_lib("kernel/include/file.hrl").
 
 -define(BACKUP_DIR, ".tarha/backups").
@@ -15,7 +22,10 @@
 -define(PROGRESS_CALLBACK, coding_agent_progress_cb).
 -define(SAFETY_CALLBACK, coding_agent_safety_cb).
 
-% Safely convert to binary with size limit
+%%===================================================================
+%% safe_binary — shared text sanitization
+%%===================================================================
+
 safe_binary(Input) when is_binary(Input) ->
     case byte_size(Input) of
         Size when Size > ?MAX_TEXT_SIZE ->
@@ -45,7 +55,6 @@ safe_binary(Input, MaxSize) when is_list(Input) ->
 safe_binary(Input, _MaxSize) ->
     safe_binary(Input).
 
-% Safe conversion for any term, handling deeply nested lists
 safe_binary_any(Term, MaxSize) ->
     try
         Flat = flatten_term(Term, MaxSize * 2),
@@ -60,7 +69,6 @@ safe_binary_any(Term, MaxSize) ->
         _:_ -> <<"[term too large to serialize]">>
     end.
 
-% Recursively flatten a term into an iolist, with depth limit
 flatten_term(Bin, _MaxSize) when is_binary(Bin) -> Bin;
 flatten_term(Int, _MaxSize) when is_integer(Int) -> integer_to_binary(Int);
 flatten_term(Float, _MaxSize) when is_float(Float) -> float_to_binary(Float);
@@ -113,7 +121,10 @@ safe_iolist_size([]) -> 0;
 safe_iolist_size([H|T]) -> safe_iolist_size(H) + safe_iolist_size(T);
 safe_iolist_size(_) -> 0.
 
-% Progress callback: fun((Operation, Status, Data) -> ok)
+%%===================================================================
+%% Callback setters
+%%===================================================================
+
 set_progress_callback(Fun) when is_function(Fun, 3) ->
     erlang:put(?PROGRESS_CALLBACK, Fun),
     ok.
@@ -140,6 +151,9 @@ clear_log() ->
         _ -> ets:delete_all_objects(?OPS_LOG)
     end.
 
+%%===================================================================
+%% tools/0 — tool schema
+%%===================================================================
 tools() ->
     [
         % File Operations
@@ -832,6 +846,11 @@ tools() ->
     ].
 
 % Execute multiple tools concurrently (for parallel operations)
+
+%%===================================================================
+%% execute_concurrent/1 — parallel tool execution
+%%===================================================================
+
 execute_concurrent(ToolCalls) when is_list(ToolCalls) ->
     Parent = self(),
     Pids = lists:map(fun({Name, Args}) ->
@@ -852,7 +871,10 @@ collect_concurrent_results(Pids, Results) ->
         #{error => timeout}
     end.
 
-% Log operation
+%%===================================================================
+%% Logging, progress, and safety — shared infrastructure
+%%===================================================================
+
 log_operation(Name, Args, Result) ->
     case ets:whereis(?OPS_LOG) of
         undefined ->
@@ -867,7 +889,6 @@ log_operation(Name, Args, Result) ->
         Result
     }).
 
-% Report progress
 report_progress(Operation, Status, Data) ->
     case erlang:get(?PROGRESS_CALLBACK) of
         undefined -> ok;
@@ -875,7 +896,6 @@ report_progress(Operation, Status, Data) ->
             try Fun(Operation, Status, Data) catch _:_ -> ok end
     end.
 
-% Safety check for dangerous operations
 safety_check(Operation, Args) ->
     case erlang:get(?SAFETY_CALLBACK) of
         undefined -> proceed;
@@ -883,679 +903,119 @@ safety_check(Operation, Args) ->
             try Fun(Operation, Args) catch _:_ -> proceed end
     end.
 
-% File Operations
-execute(<<"read_file">>, #{<<"path">> := Path}) ->
-    report_progress(<<"read_file">>, <<"starting">>, #{path => Path}),
-    PathStr = sanitize_path(Path),
-    case file:read_file(PathStr) of
-        {ok, Content} ->
-            % Truncate large files
-            SafeContent = safe_binary(Content),
-            Result = #{<<"success">> => true, <<"content">> => SafeContent},
-            log_operation(<<"read_file">>, Path, Result),
-            report_progress(<<"read_file">>, <<"complete">>, #{path => Path, size => byte_size(SafeContent)}),
-            Result;
-        {error, Reason} ->
-            Result = #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))},
-            log_operation(<<"read_file">>, Path, Result),
-            Result
-    end;
+%%===================================================================
+%% execute/2 — dispatch to sub-modules
+%%===================================================================
 
-execute(<<"edit_file">>, #{<<"path">> := Path, <<"old_string">> := OldStr, <<"new_string">> := NewStr} = Args) ->
-    % Safety check for file modifications
-    case safety_check(<<"edit_file">>, Args) of
-        skip -> #{<<"success">> => false, <<"error">> => <<"Operation skipped by safety check">>};
-        {modify, NewArgs} -> execute(<<"edit_file">>, NewArgs);
-        proceed ->
-            report_progress(<<"edit_file">>, <<"starting">>, #{path => Path}),
-            PathStr = sanitize_path(Path),
-            ReplaceAll = maps:get(<<"replace_all">>, Args, false),
-            case file:read_file(PathStr) of
-                {ok, Content} ->
-                    ContentStr = binary_to_list(Content),
-                    OldStrList = binary_to_list(OldStr),
-                    NewStrList = binary_to_list(NewStr),
-                    case find_occurrences(ContentStr, OldStrList) of
-                        0 ->
-                            Result = #{<<"success">> => false, <<"error">> => <<"Old string not found in file">>},
-                            log_operation(<<"edit_file">>, Path, Result),
-                            Result;
-                        Count when Count > 1 andalso ReplaceAll =/= true ->
-                            Result = #{<<"success">> => false, <<"error">> => iolist_to_binary(io_lib:format("Found ~b occurrences. Use replace_all to replace all.", [Count]))},
-                            log_operation(<<"edit_file">>, Path, Result),
-                            Result;
-                        _ ->
-                            _ = create_backup_internal(PathStr),
-                            NewContent = case ReplaceAll of
-                                true -> replace_all(ContentStr, OldStrList, NewStrList);
-                                false -> string:replace(ContentStr, OldStrList, NewStrList)
-                            end,
-                            case file:write_file(PathStr, list_to_binary(NewContent)) of
-                                ok ->
-                                    Result = #{<<"success">> => true, <<"message">> => <<"File edited successfully">>},
-                                    log_operation(<<"edit_file">>, Path, Result),
-                                    report_progress(<<"edit_file">>, <<"complete">>, #{path => Path}),
-                                    Result;
-                                {error, Reason} ->
-                                    restore_backup_internal(PathStr),
-                                    Result = #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))},
-                                    log_operation(<<"edit_file">>, Path, Result),
-                                    Result
-                            end
-                    end;
-                {error, Reason} ->
-                    Result = #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))},
-                    log_operation(<<"edit_file">>, Path, Result),
-                    Result
-            end
-    end;
+% File Operations -> coding_agent_tools_file
+execute(<<"read_file">>, Args) -> coding_agent_tools_file:execute(<<"read_file">>, Args);
+execute(<<"edit_file">>, Args) -> coding_agent_tools_file:execute(<<"edit_file">>, Args);
+execute(<<"write_file">>, Args) -> coding_agent_tools_file:execute(<<"write_file">>, Args);
+execute(<<"create_directory">>, Args) -> coding_agent_tools_file:execute(<<"create_directory">>, Args);
+execute(<<"list_files">>, Args) -> coding_agent_tools_file:execute(<<"list_files">>, Args);
+execute(<<"file_exists">>, Args) -> coding_agent_tools_file:execute(<<"file_exists">>, Args);
 
-execute(<<"write_file">>, #{<<"path">> := Path, <<"content">> := Content} = Args) ->
-    case safety_check(<<"write_file">>, Args) of
-        skip -> #{<<"success">> => false, <<"error">> => <<"Operation skipped by safety check">>};
-        {modify, NewArgs} -> execute(<<"write_file">>, NewArgs);
-        proceed ->
-            report_progress(<<"write_file">>, <<"starting">>, #{path => Path}),
-            PathStr = sanitize_path(Path),
-            case filelib:is_file(PathStr) of
-                true -> _ = create_backup_internal(PathStr);
-                false -> ok
-            end,
-            case file:write_file(PathStr, Content) of
-                ok ->
-                    Result = #{<<"success">> => true, <<"message">> => <<"File written successfully">>},
-                    log_operation(<<"write_file">>, Path, Result),
-                    report_progress(<<"write_file">>, <<"complete">>, #{path => Path}),
-                    Result;
-                {error, Reason} ->
-                    Result = #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))},
-                    log_operation(<<"write_file">>, Path, Result),
-                    Result
-            end
-    end;
+% Git Operations -> coding_agent_tools_git
+execute(<<"git_status">>, Args) -> coding_agent_tools_git:execute(<<"git_status">>, Args);
+execute(<<"git_diff">>, Args) -> coding_agent_tools_git:execute(<<"git_diff">>, Args);
+execute(<<"git_log">>, Args) -> coding_agent_tools_git:execute(<<"git_log">>, Args);
+execute(<<"git_add">>, Args) -> coding_agent_tools_git:execute(<<"git_add">>, Args);
+execute(<<"git_commit">>, Args) -> coding_agent_tools_git:execute(<<"git_commit">>, Args);
+execute(<<"git_branch">>, Args) -> coding_agent_tools_git:execute(<<"git_branch">>, Args);
 
-execute(<<"create_directory">>, #{<<"path">> := Path}) ->
-    PathStr = sanitize_path(Path),
-    case filelib:is_dir(PathStr) of
-        true -> #{<<"success">> => true, <<"message">> => <<"Directory already exists">>};
-        false ->
-            case filelib:ensure_dir(PathStr ++ "/") of
-                ok ->
-                    case file:make_dir(PathStr) of
-                        ok -> #{<<"success">> => true, <<"message">> => <<"Directory created">>};
-                        {error, Reason} -> #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
-                    end;
-                {error, Reason} -> #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
-            end
-    end;
+% Search Operations -> coding_agent_tools_search
+execute(<<"grep_files">>, Args) -> coding_agent_tools_search:execute(<<"grep_files">>, Args);
+execute(<<"find_files">>, Args) -> coding_agent_tools_search:execute(<<"find_files">>, Args);
 
-execute(<<"list_files">>, Args) ->
-    Path = maps:get(<<"path">>, Args, <<".">>),
-    Recursive = maps:get(<<"recursive">>, Args, false),
-    PathStr = sanitize_path(Path),
-    list_files_impl(PathStr, Recursive);
+% Undo/Backup Operations -> coding_agent_tools_undo
+execute(<<"undo_edit">>, Args) -> coding_agent_tools_undo:execute(<<"undo_edit">>, Args);
+execute(<<"list_backups">>, Args) -> coding_agent_tools_undo:execute(<<"list_backups">>, Args);
+execute(<<"undo">>, Args) -> coding_agent_tools_undo:execute(<<"undo">>, Args);
+execute(<<"redo">>, Args) -> coding_agent_tools_undo:execute(<<"redo">>, Args);
+execute(<<"undo_history">>, Args) -> coding_agent_tools_undo:execute(<<"undo_history">>, Args);
+execute(<<"begin_transaction">>, Args) -> coding_agent_tools_undo:execute(<<"begin_transaction">>, Args);
+execute(<<"end_transaction">>, Args) -> coding_agent_tools_undo:execute(<<"end_transaction">>, Args);
+execute(<<"cancel_transaction">>, Args) -> coding_agent_tools_undo:execute(<<"cancel_transaction">>, Args);
 
-execute(<<"file_exists">>, #{<<"path">> := Path}) ->
-    PathStr = sanitize_path(Path),
-    case filelib:is_file(PathStr) of
-        true -> #{<<"success">> => true, <<"exists">> => true};
-        false ->
-            case filelib:is_dir(PathStr) of
-                true -> #{<<"success">> => true, <<"exists">> => true, <<"type">> => <<"directory">>};
-                false -> #{<<"success">> => true, <<"exists">> => false}
-            end
-    end;
+% Build/Test Operations -> coding_agent_tools_build
+execute(<<"run_tests">>, Args) -> coding_agent_tools_build:execute(<<"run_tests">>, Args);
+execute(<<"run_build">>, Args) -> coding_agent_tools_build:execute(<<"run_build">>, Args);
+execute(<<"run_linter">>, Args) -> coding_agent_tools_build:execute(<<"run_linter">>, Args);
+execute(<<"detect_project">>, Args) -> coding_agent_tools_build:execute(<<"detect_project">>, Args);
 
-% Git Operations
-execute(<<"git_status">>, _Args) ->
-    run_git_command("git status --porcelain");
+% Command/HTTP Operations -> coding_agent_tools_command
+execute(<<"run_command">>, Args) -> coding_agent_tools_command:execute(<<"run_command">>, Args);
+execute(<<"http_request">>, Args) -> coding_agent_tools_command:execute(<<"http_request">>, Args);
+execute(<<"execute_parallel">>, Args) -> coding_agent_tools_command:execute(<<"execute_parallel">>, Args);
 
-execute(<<"git_diff">>, Args) ->
-    File = maps:get(<<"file">>, Args, undefined),
-    Staged = maps:get(<<"staged">>, Args, false),
-    Cmd = case {File, Staged} of
-        {undefined, true} -> "git diff --cached";
-        {undefined, false} -> "git diff";
-        {F, true} -> "git diff --cached " ++ binary_to_list(F);
-        {F, false} -> "git diff " ++ binary_to_list(F)
-    end,
-    run_git_command(Cmd);
+% Refactor/Smart Operations -> coding_agent_tools_refactor
+execute(<<"smart_commit">>, Args) -> coding_agent_tools_refactor:execute(<<"smart_commit">>, Args);
+execute(<<"resolve_merge_conflicts">>, Args) -> coding_agent_tools_refactor:execute(<<"resolve_merge_conflicts">>, Args);
+execute(<<"review_changes">>, Args) -> coding_agent_tools_refactor:execute(<<"review_changes">>, Args);
+execute(<<"generate_tests">>, Args) -> coding_agent_tools_refactor:execute(<<"generate_tests">>, Args);
 
-execute(<<"git_log">>, Args) ->
-    Count = maps:get(<<"count">>, Args, 10),
-    Cmd = "git log --oneline -n " ++ integer_to_list(Count),
-    run_git_command(Cmd);
+% Self-Modification -> coding_agent_tools_self
+execute(<<"reload_module">>, Args) -> coding_agent_tools_self:execute(<<"reload_module">>, Args);
+execute(<<"get_self_modules">>, Args) -> coding_agent_tools_self:execute(<<"get_self_modules">>, Args);
+execute(<<"analyze_self">>, Args) -> coding_agent_tools_self:execute(<<"analyze_self">>, Args);
+execute(<<"deploy_module">>, Args) -> coding_agent_tools_self:execute(<<"deploy_module">>, Args);
+execute(<<"create_checkpoint">>, Args) -> coding_agent_tools_self:execute(<<"create_checkpoint">>, Args);
+execute(<<"restore_checkpoint">>, Args) -> coding_agent_tools_self:execute(<<"restore_checkpoint">>, Args);
+execute(<<"list_checkpoints">>, Args) -> coding_agent_tools_self:execute(<<"list_checkpoints">>, Args);
 
-execute(<<"git_add">>, #{<<"files">> := Files}) ->
-    FilesStr = lists:map(fun binary_to_list/1, Files),
-    Cmd = "git add " ++ string:join(FilesStr, " "),
-    run_git_command(Cmd);
+% Model Operations -> coding_agent_tools_model
+execute(<<"list_models">>, Args) -> coding_agent_tools_model:execute(<<"list_models">>, Args);
+execute(<<"switch_model">>, Args) -> coding_agent_tools_model:execute(<<"switch_model">>, Args);
+execute(<<"show_model">>, Args) -> coding_agent_tools_model:execute(<<"show_model">>, Args);
 
-execute(<<"git_commit">>, #{<<"message">> := Msg} = Args) ->
-    case safety_check(<<"git_commit">>, Args) of
-        skip -> #{<<"success">> => false, <<"error">> => <<"Operation skipped by safety check">>};
-        {modify, NewArgs} -> execute(<<"git_commit">>, NewArgs);
-        proceed ->
-            MsgStr = binary_to_list(Msg),
-            SafeMsg = lists:filter(fun(C) -> C =/= $' andalso C =/= $" end, MsgStr),
-            % Add Co-Authored-By trailer
-            CoAuthoredBy = "\n\nCo-Authored-By: TriusAI Tarha <trius@canton.graphics>",
-            FullMsg = SafeMsg ++ CoAuthoredBy,
-            Cmd = "git commit -m '" ++ FullMsg ++ "'",
-            run_git_command(Cmd)
-    end;
+% Skills -> coding_agent_tools_skills
+execute(<<"list_skills">>, Args) -> coding_agent_tools_skills:execute(<<"list_skills">>, Args);
+execute(<<"load_skill">>, Args) -> coding_agent_tools_skills:execute(<<"load_skill">>, Args);
 
-execute(<<"git_branch">>, #{<<"action">> := Action} = Args) ->
-    case Action of
-        <<"list">> -> run_git_command("git branch -a");
-        <<"create">> ->
-            case maps:get(<<"name">>, Args, undefined) of
-                undefined -> #{<<"success">> => false, <<"error">> => <<"Branch name required">>};
-                Name -> run_git_command("git checkout -b " ++ binary_to_list(Name))
-            end;
-        <<"switch">> ->
-            case maps:get(<<"name">>, Args, undefined) of
-                undefined -> #{<<"success">> => false, <<"error">> => <<"Branch name required">>};
-                Name -> run_git_command("git checkout " ++ binary_to_list(Name))
-            end
-    end;
-
-% Build/Test Operations
-execute(<<"run_tests">>, Args) ->
-    Pattern = maps:get(<<"pattern">>, Args, undefined),
-    Verbose = maps:get(<<"verbose">>, Args, false),
-    detect_and_run_tests(Pattern, Verbose);
-
-execute(<<"run_build">>, Args) ->
-    Target = maps:get(<<"target">>, Args, undefined),
-    detect_and_run_build(Target);
-
-execute(<<"run_linter">>, Args) ->
-    Fix = maps:get(<<"fix">>, Args, false),
-    detect_and_run_linter(Fix);
-
-% Search Operations
-execute(<<"grep_files">>, Args) ->
-    Pattern = binary_to_list(maps:get(<<"pattern">>, Args)),
-    Path = case maps:get(<<"path">>, Args, <<".">>) of
-        <<".">> -> ".";
-        P -> binary_to_list(P)
-    end,
-    FilePattern = maps:get(<<"file_pattern">>, Args, undefined),
-    Cmd = case FilePattern of
-        undefined -> "grep -rn \"" ++ Pattern ++ "\" " ++ Path ++ " 2>/dev/null || true";
-        FP -> "grep -rn --include=\"" ++ binary_to_list(FP) ++ "\" \"" ++ Pattern ++ "\" " ++ Path ++ " 2>/dev/null || true"
-    end,
-    Result = os:cmd(Cmd),
-    case Result of
-        [] -> #{<<"success">> => true, <<"matches">> => <<"No matches found">>};
-        _ ->
-            Trimmed = string:trim(Result, trailing, "\n"),
-            Limited = limit_grep_output(unicode:characters_to_binary(Trimmed), 10000),
-            #{<<"success">> => true, <<"matches">> => Limited}
-    end;
-
-execute(<<"find_files">>, #{<<"pattern">> := Pattern} = Args) ->
-    PatternStr = binary_to_list(Pattern),
-    Path = case maps:get(<<"path">>, Args, <<".">>) of
-        <<".">> -> ".";
-        P -> binary_to_list(P)
-    end,
-    Cmd = "find " ++ Path ++ " -name \"" ++ PatternStr ++ "\" -type f 2>/dev/null || true",
-    Result = os:cmd(Cmd),
-    case Result of
-        [] -> #{<<"success">> => true, <<"files">> => []};
-        _ ->
-            Trimmed = string:trim(Result, trailing, "\n"),
-            Files = string:split(Trimmed, "\n", all),
-            #{<<"success">> => true, <<"files">> => [unicode:characters_to_binary(F) || F <- Files]}
-    end;
-
-% Backup Operations
-execute(<<"undo_edit">>, #{<<"path">> := Path}) ->
-    PathStr = sanitize_path(Path),
-    case restore_backup_internal(PathStr) of
-        {ok, _} -> #{<<"success">> => true, <<"message">> => <<"File restored from backup">>};
-        {error, Reason} -> #{<<"success">> => false, <<"error">> => list_to_binary(Reason)}
-    end;
-
-execute(<<"list_backups">>, _Args) ->
-    Backups = list_backups_impl(),
-    #{<<"success">> => true, <<"backups">> => Backups};
-
-% Undo/Redo Stack Operations
-execute(<<"undo">>, Args) ->
-    Count = maps:get(<<"count">>, Args, 1),
-    case coding_agent_undo:undo(Count) of
-        {ok, Results} ->
-            #{<<"success">> => true, <<"undone">> => length(Results), <<"results">> => format_undo_results(Results)};
-        {error, nothing_to_undo} ->
-            #{<<"success">> => false, <<"error">> => <<"Nothing to undo">>};
-        {error, partial_undo, Results} ->
-            #{<<"success">> => false, <<"error">> => <<"Partial undo">>, <<"results">> => format_undo_results(Results)}
-    end;
-
-execute(<<"redo">>, Args) ->
-    Count = maps:get(<<"count">>, Args, 1),
-    case coding_agent_undo:redo(Count) of
-        {ok, Results} ->
-            #{<<"success">> => true, <<"redone">> => length(Results), <<"results">> => format_undo_results(Results)};
-        {error, nothing_to_redo} ->
-            #{<<"success">> => false, <<"error">> => <<"Nothing to redo">>};
-        {error, partial_redo, Results} ->
-            #{<<"success">> => false, <<"error">> => <<"Partial redo">>, <<"results">> => format_undo_results(Results)}
-    end;
-
-execute(<<"undo_history">>, Args) ->
-    Count = maps:get(<<"count">>, Args, 10),
-    case coding_agent_undo:get_history(Count) of
-        History when is_list(History) ->
-            #{<<"success">> => true, <<"history">> => History, <<"count">> => length(History)};
-        _ ->
-            #{<<"success">> => false, <<"error">> => <<"Failed to get undo history">>}
-    end;
-
-execute(<<"begin_transaction">>, _Args) ->
-    case coding_agent_undo:begin_transaction() of
-        {ok, TxnId} ->
-            #{<<"success">> => true, <<"transaction_id">> => TxnId};
-        {error, transaction_in_progress} ->
-            #{<<"success">> => false, <<"error">> => <<"Transaction already in progress">>}
-    end;
-
-execute(<<"end_transaction">>, _Args) ->
-    case coding_agent_undo:end_transaction() of
-        {ok, OpId} ->
-            #{<<"success">> => true, <<"operation_id">> => OpId};
-        {error, no_transaction} ->
-            #{<<"success">> => false, <<"error">> => <<"No transaction in progress">>}
-    end;
-
-execute(<<"cancel_transaction">>, _Args) ->
-    case coding_agent_undo:cancel_transaction() of
-        ok ->
-            #{<<"success">> => true, <<"message">> => <<"Transaction cancelled">>};
-        {error, no_transaction} ->
-            #{<<"success">> => false, <<"error">> => <<"No transaction in progress">>}
-    end;
-
-% Project Detection
-execute(<<"detect_project">>, Args) ->
-    Path = case maps:get(<<"path">>, Args, <<".">>) of
-        <<".">> -> ".";
-        P -> binary_to_list(P)
-    end,
-    detect_project_impl(Path);
-
-% Command Execution
-execute(<<"run_command">>, #{<<"command">> := Command} = Args) ->
-    case safety_check(<<"run_command">>, Args) of
-        skip -> #{<<"success">> => false, <<"error">> => <<"Operation skipped by safety check">>};
-        {modify, NewArgs} -> execute(<<"run_command">>, NewArgs);
-        proceed ->
-            CmdStr = binary_to_list(Command),
-            Timeout = maps:get(<<"timeout">>, Args, 30000),
-            Cwd = case maps:get(<<"cwd">>, Args, undefined) of
-                undefined -> ".";
-                CwdPath -> binary_to_list(CwdPath)
-            end,
-            report_progress(<<"run_command">>, <<"starting">>, #{command => Command}),
-            Result = run_command_impl(CmdStr, Timeout, Cwd),
-            log_operation(<<"run_command">>, Command, Result),
-            Result
-    end;
-
-% Auto-commit with smart message
-execute(<<"smart_commit">>, Args) ->
-    case safety_check(<<"smart_commit">>, Args) of
-        skip -> #{<<"success">> => false, <<"error">> => <<"Operation skipped by safety check">>};
-        {modify, NewArgs} -> execute(<<"smart_commit">>, NewArgs);
-        proceed ->
-            Preview = maps:get(<<"preview">>, Args, false),
-            DiffCmd = "git diff --cached",
-            StagedDiff = os:cmd(DiffCmd),
-            case StagedDiff of
-                [] ->
-                    #{<<"success">> => false, <<"error">> => <<"No staged changes. Use git add first.">>};
-                Diff ->
-                    CommitMsg = generate_commit_message(Diff),
-                    % Add Co-Authored-By trailer
-                    CoAuthoredBy = <<"\n\nCo-Authored-By: TriusAI Tarha <trius@canton.graphics>">>,
-                    FullMsg = <<CommitMsg/binary, CoAuthoredBy/binary>>,
-                    case Preview of
-                        true ->
-                            #{<<"success">> => true, 
-                              <<"preview">> => true,
-                              <<"message">> => FullMsg,
-                                <<"diff">> => clean_output(string:trim(Diff, trailing))};
-                        false ->
-                            CommitCmd = "git commit -m '" ++ binary_to_list(FullMsg) ++ "'",
-                            Result = os:cmd(CommitCmd ++ " 2>&1"),
-                            #{<<"success">> => true,
-                              <<"message">> => FullMsg,
-                                <<"output">> => clean_output(string:trim(Result, trailing))}
-                    end
-            end
-    end;
-
-% Merge Conflict Resolution
-execute(<<"resolve_merge_conflicts">>, Args) ->
-    File = maps:get(<<"file">>, Args, undefined),
-    Strategy = maps:get(<<"strategy">>, Args, <<"smart">>),
-    
-    % Find files with conflicts
-    ConflictFiles = case File of
-        undefined -> 
-            Output = os:cmd("git diff --name-only --diff-filter=U 2>/dev/null"),
-            string:tokens(Output, "\n");
-        F ->
-            [binary_to_list(F)]
-    end,
-    
-    case ConflictFiles of
-        [] ->
-            #{<<"success">> => true, <<"message">> => <<"No merge conflicts found.">>};
-        Files ->
-            Results = lists:map(fun(FilePath) ->
-                case resolve_conflicts_in_file(FilePath, Strategy) of
-                    {ok, Resolution} ->
-                        #{<<"file">> => list_to_binary(FilePath), 
-                          <<"status">> => <<"resolved">>,
-                          <<"strategy">> => Resolution};
-                    {error, Reason} ->
-                        #{<<"file">> => list_to_binary(FilePath),
-                          <<"status">> => <<"failed">>,
-                          <<"error">> => Reason}
-                end
-            end, Files),
-            SuccessCount = length([R || R <- Results, maps:get(<<"status">>, R) == <<"resolved">>]),
-            #{<<"success">> => true,
-              <<"resolved_count">> => SuccessCount,
-              <<"total_count">> => length(Files),
-              <<"files">> => Results}
-    end;
-
-% Code Review
-execute(<<"review_changes">>, Args) ->
-    Staged = maps:get(<<"staged">>, Args, true),
-    File = maps:get(<<"file">>, Args, undefined),
-    
-    DiffCmd = case {Staged, File} of
-        {true, undefined} -> "git diff --cached";
-        {true, F} -> "git diff --cached " ++ binary_to_list(F);
-        {false, undefined} -> "git diff";
-        {false, F} -> "git diff " ++ binary_to_list(F)
-    end,
-    
-    Diff = os:cmd(DiffCmd ++ " 2>&1"),
-    case Diff of
-        [] -> 
-            #{<<"success">> => false, <<"error">> => <<"No changes to review.">>};
-        _ ->
-            Review = analyze_diff(Diff),
-            #{
-                <<"success">> => true,
-                            <<"diff">> => clean_output(string:trim(Diff, trailing)),
-                <<"review">> => Review,
-                <<"summary">> => generate_review_summary(Diff)
-            }
-    end;
-
-% Test Generation
-execute(<<"generate_tests">>, #{<<"file">> := FilePath} = Args) ->
-    PathStr = sanitize_path(FilePath),
-    Function = maps:get(<<"function">>, Args, undefined),
-    Framework = maps:get(<<"framework">>, Args, <<"eunit">>),
-    
-    case file:read_file(PathStr) of
-        {ok, Content} ->
-            Functions = case Function of
-                undefined -> extract_all_functions(Content, PathStr);
-                _ -> [binary_to_list(Function)]
-            end,
-            
-            GeneratedTests = lists:map(fun(FuncName) ->
-                generate_function_tests(FuncName, Content, PathStr, Framework)
-            end, Functions),
-            
-            TestFile = generate_test_file(FilePath, GeneratedTests, Framework),
-            #{
-                <<"success">> => true,
-                <<"file">> => list_to_binary(PathStr),
-                <<"functions">> => Functions,
-                <<"framework">> => Framework,
-                <<"test_file">> => TestFile,
-                <<"tests">> => GeneratedTests
-            };
-        {error, Reason} ->
-            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
-    end;
-    
-% Self-Modification Tools
-execute(<<"reload_module">>, #{<<"module">> := Module}) ->
-    ModuleAtom = binary_to_existing_atom(Module, utf8),
-    case coding_agent_self:reload_module(ModuleAtom) of
-        #{success := true} = Result -> Result;
-        #{success := false, error := Error} -> #{<<"success">> => false, <<"error">> => Error}
-    end;
-
-execute(<<"get_self_modules">>, _Args) ->
-    {ok, Modules} = coding_agent_self:get_modules(),
-    #{<<"success">> => true, <<"modules">> => Modules};
-
-execute(<<"analyze_self">>, _Args) ->
-    {ok, Analysis} = coding_agent_self:analyze_self(),
-    #{<<"success">> => true, <<"analysis">> => Analysis};
-
-execute(<<"deploy_module">>, #{<<"module">> := Module, <<"code">> := Code}) ->
-    ModuleAtom = binary_to_existing_atom(Module, utf8),
-    case coding_agent_self:deploy_improvement(ModuleAtom, Code) of
-        #{success := true} = Result -> Result;
-        #{success := false, error := Error} -> #{<<"success">> => false, <<"error">> => Error}
-    end;
-
-execute(<<"create_checkpoint">>, _Args) ->
-    case coding_agent_self:create_checkpoint() of
-        #{success := true} = Result -> Result;
-        #{success := false, error := Error} -> #{<<"success">> => false, <<"error">> => Error}
-    end;
-
-execute(<<"restore_checkpoint">>, #{<<"checkpoint_id">> := CheckpointId}) ->
-    case coding_agent_self:restore_checkpoint(CheckpointId) of
-        #{success := true} = Result -> Result;
-        #{success := false, error := Error} -> #{<<"success">> => false, <<"error">> => Error}
-    end;
-
-execute(<<"list_checkpoints">>, _Args) ->
-    {ok, Checkpoints} = coding_agent_self:list_checkpoints(),
-    #{<<"success">> => true, <<"checkpoints">> => Checkpoints};
-
+% Inline (trivial)
 execute(<<"hello">>, _Args) ->
     io:format("hello world~n"),
     #{<<"success">> => true, <<"message">> => <<"hello world">>};
 
-% Model Management
-execute(<<"list_models">>, _Args) ->
-    report_progress(<<"list_models">>, <<"starting">>, #{}),
-    case coding_agent_ollama:list_models() of
-        {ok, Models} ->
-            Result = #{<<"success">> => true, <<"models">> => Models, <<"count">> => length(Models)},
-            report_progress(<<"list_models">>, <<"complete">>, #{count => length(Models)}),
-            Result;
-        {error, Reason} ->
-            Result = #{<<"success">> => false, <<"error">> => safe_binary(Reason)},
-            report_progress(<<"list_models">>, <<"error">>, #{reason => Reason}),
-            Result
-    end;
-
-execute(<<"switch_model">>, #{<<"model">> := Model}) ->
-    report_progress(<<"switch_model">>, <<"starting">>, #{model => Model}),
-    case coding_agent_ollama:switch_model(Model) of
-        {ok, OldModel, NewModel} ->
-            Result = #{<<"success">> => true, <<"old_model">> => OldModel, <<"new_model">> => NewModel},
-            log_operation(<<"switch_model">>, Model, Result),
-            report_progress(<<"switch_model">>, <<"complete">>, #{old => OldModel, new => NewModel}),
-            Result;
-        {error, Reason} ->
-            Result = #{<<"success">> => false, <<"error">> => safe_binary(Reason)},
-            report_progress(<<"switch_model">>, <<"error">>, #{reason => Reason}),
-            Result
-    end;
-
-execute(<<"show_model">>, #{<<"model">> := Model} = Args) ->
-    Verbose = maps:get(<<"verbose">>, Args, false),
-    Opts = #{verbose => Verbose},
-    report_progress(<<"show_model">>, <<"starting">>, #{model => Model, verbose => Verbose}),
-    case coding_agent_ollama:show_model(Model, Opts) of
-        {ok, ModelInfo} ->
-            %% Extract key fields for easier consumption
-            Details = maps:get(<<"details">>, ModelInfo, #{}),
-            Capabilities = maps:get(<<"capabilities">>, ModelInfo, []),
-            Parameters = maps:get(<<"parameters">>, ModelInfo, undefined),
-            ModelInfoMap = maps:get(<<"model_info">>, ModelInfo, #{}),
-            
-            Result = #{
-                <<"success">> => true,
-                <<"model">> => Model,
-                <<"details">> => Details,
-                <<"capabilities">> => Capabilities,
-                <<"parameters">> => Parameters,
-                <<"model_info">> => ModelInfoMap,
-                <<"license">> => maps:get(<<"license">>, ModelInfo, undefined),
-                <<"modified_at">> => maps:get(<<"modified_at">>, ModelInfo, undefined),
-                <<"template">> => maps:get(<<"template">>, ModelInfo, undefined)
-            },
-            report_progress(<<"show_model">>, <<"complete">>, #{model => Model}),
-            Result;
-        {error, Reason} ->
-            Result = #{<<"success">> => false, <<"error">> => safe_binary(Reason)},
-            report_progress(<<"show_model">>, <<"error">>, #{reason => Reason}),
-            Result
-    end;
-
-% HTTP Client
-execute(<<"http_request">>, Args) ->
-    Url = maps:get(<<"url">>, Args),
-    Method = maps:get(<<"method">>, Args, <<"GET">>),
-    Headers = maps:get(<<"headers">>, Args, #{}),
-    Body = maps:get(<<"body">>, Args, undefined),
-    Timeout = maps:get(<<"timeout">>, Args, 30000),
-    FollowRedirect = maps:get(<<"follow_redirect">>, Args, true),
-    ResponseFormat = maps:get(<<"response_format">>, Args, <<"auto">>),
-    http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat);
-
-% Parallel Execution
-execute(<<"execute_parallel">>, #{<<"calls">> := Calls}) ->
-    execute_parallel_impl(Calls);
-
-% Skills
-execute(<<"list_skills">>, Args) ->
-    AvailableOnly = maps:get(<<"available_only">>, Args, false),
-    report_progress(<<"list_skills">>, <<"starting">>, #{}),
-    case coding_agent_skills:list_skills(AvailableOnly) of
-        {ok, Skills} ->
-            Result = #{
-                <<"success">> => true,
-                <<"skills">> => Skills,
-                <<"count">> => length(Skills)
-            },
-            report_progress(<<"list_skills">>, <<"complete">>, #{count => length(Skills)}),
-            Result;
-        {error, Reason} ->
-            Result = #{<<"success">> => false, <<"error">> => safe_binary(Reason)},
-            report_progress(<<"list_skills">>, <<"error">>, #{reason => Reason}),
-            Result
-    end;
-
-execute(<<"load_skill">>, #{<<"name">> := Name}) ->
-    report_progress(<<"load_skill">>, <<"starting">>, #{name => Name}),
-    case coding_agent_skills:load_skill(Name) of
-        {ok, Content} ->
-            Result = #{
-                <<"success">> => true,
-                <<"name">> => Name,
-                <<"content">> => safe_binary(Content)
-            },
-            report_progress(<<"load_skill">>, <<"complete">>, #{name => Name}),
-            Result;
-        {error, Reason} ->
-            Result = #{<<"success">> => false, <<"error">> => safe_binary(Reason)},
-            report_progress(<<"load_skill">>, <<"error">>, #{reason => Reason}),
-            Result
-    end;
-
+% Catch-all
 execute(_Tool, _Args) ->
     #{<<"success">> => false, <<"error">> => <<"Unknown tool">>}.
 
-% Internal implementations
-detect_and_run_tests(Pattern, Verbose) ->
-    VerboseFlag = case Verbose of true -> " -v"; false -> "" end,
-    TestCommands = [
-        {"rebar3.config" ++ VerboseFlag ++ " eunit", "Erlang (rebar3 eunit)"},
-        {"mix test", "Elixir (mix test)"},
-        {"npm test", "Node.js (npm test)"},
-        {"cargo test", "Rust (cargo test)"},
-        {"go test ./...", "Go (go test)"},
-        {"pytest", "Python (pytest)"}
-    ],
-    run_detected_command(TestCommands, <<"run_tests">>, Pattern).
+%%===================================================================
+%% http_request — delegates to command module
+%%===================================================================
 
-detect_and_run_build(Target) ->
-    TargetArg = case Target of
-        undefined -> "";
-        T -> " " ++ binary_to_list(T)
-    end,
-    BuildCommands = [
-        {"rebar3 compile", "Erlang (rebar3 compile)"},
-        {"mix compile", "Elixir (mix compile)"},
-        {"npm run build", "Node.js (npm build)"},
-        {"cargo build" ++ TargetArg, "Rust (cargo build)"},
-        {"go build", "Go (go build)"},
-        {"mvn compile", "Java (Maven)"},
-        {"gradle build", "Java (Gradle)"}
-    ],
-    run_detected_command(BuildCommands, <<"run_build">>, undefined).
+http_request(Url) ->
+    coding_agent_tools_command:http_request(Url).
 
-detect_and_run_linter(Fix) ->
-    FixFlag = case Fix of true -> " --fix"; false -> "" end,
-    LinterCommands = [
-        {"rebar3 fmt" ++ FixFlag, "Erlang (rebar3 fmt)"},
-        {"mix format", "Elixir (mix format)"},
-        {"npm run lint" ++ FixFlag, "Node.js (npm lint)"},
-        {"cargo clippy", "Rust (cargo clippy)"},
-        {"gofmt -w .", "Go (gofmt)"}
-    ],
-    run_detected_command(LinterCommands, <<"run_linter">>, undefined).
+http_request(Url, Opts) ->
+    coding_agent_tools_command:http_request(Url, Opts).
 
-run_detected_command(Commands, OpName, ExtraArg) ->
-    report_progress(OpName, <<"detecting">>, #{}),
-    Found = lists:filtermap(fun({Cmd, _Desc}) ->
-        [Prog | _] = string:split(Cmd, " "),
-        case os:find_executable(Prog) of
-            false -> false;
-            _ ->
-                case filelib:is_file(Prog) of
-                    true -> {true, Cmd};
-                    false ->
-                        case filelib:is_file(filename:basename(Prog)) of
-                            true -> {true, Cmd};
-                            false -> {true, Cmd}
-                        end
-                end
-        end
-    end, Commands),
-    case Found of
-        [Cmd | _] ->
-            FinalCmd = case ExtraArg of
-                undefined -> Cmd;
-                Pattern -> Cmd ++ " " ++ binary_to_list(Pattern)
-            end,
-            report_progress(OpName, <<"running">>, #{command => list_to_binary(FinalCmd)}),
-            Result = run_command_impl(FinalCmd, 120000, "."),
-            Result#{<<"command">> => list_to_binary(FinalCmd)};
-        [] ->
-            #{<<"success">> => false, <<"error">> => <<"No suitable build/test tool found">>}
+%%===================================================================
+%% Backup public API
+%%===================================================================
+
+create_backup(Path) when is_list(Path) ->
+    create_backup_internal(Path).
+
+restore_backup(Path) when is_list(Path) ->
+    restore_backup_internal(Path).
+
+list_backups() ->
+    list_backups_impl().
+
+clear_backups() ->
+    BackupDir = ?BACKUP_DIR,
+    case filelib:is_dir(BackupDir) of
+        false -> ok;
+        true ->
+            Files = filelib:wildcard(filename:join(BackupDir, "*")),
+            lists:foreach(fun(F) -> file:delete(F) end, Files)
     end.
+
+%%===================================================================
+%% Shared utilities (exported — called by sub-modules)
+%%===================================================================
 
 sanitize_path(Path) when is_binary(Path) ->
     binary_to_list(Path);
@@ -1568,53 +1028,49 @@ find_occurrences(Content, Pattern) ->
 replace_all(Content, Old, New) ->
     binary_to_list(binary:replace(list_to_binary(Content), list_to_binary(Old), list_to_binary(New), [global])).
 
-list_files_impl(Path, Recursive) ->
-    case file:list_dir(Path) of
-        {ok, Files} ->
-            FilesWithInfo = lists:filtermap(fun(F) ->
-                FullPath = filename:join(Path, F),
-                case file:read_file_info(FullPath) of
-                    {ok, Info} ->
-                        Type = case Info#file_info.type of
-                            regular -> <<"file">>;
-                            directory -> <<"directory">>;
-                            _ -> <<"other">>
-                        end,
-                        {true, #{
-                            <<"name">> => list_to_binary(F),
-                            <<"type">> => Type,
-                            <<"size">> => Info#file_info.size
-                        }};
-                    _ -> false
-                end
-            end, Files),
-            case Recursive of
-                true ->
-                    Dirs = [filename:join(Path, F) || F <- Files, filelib:is_dir(filename:join(Path, F))],
-                    SubFiles = lists:flatmap(fun(D) ->
-                        case list_files_impl(D, true) of
-                            #{<<"success">> := true, <<"files">> := Fs} -> Fs;
-                            _ -> []
-                        end
-                    end, Dirs),
-                    #{<<"success">> => true, <<"files">> => FilesWithInfo ++ SubFiles};
-                false ->
-                    #{<<"success">> => true, <<"files">> => FilesWithInfo}
-            end;
+contains_merge_conflict(Cmd) when is_list(Cmd) ->
+    lists:any(fun(Pattern) -> string:str(Cmd, Pattern) > 0 end,
+              ["<<<<<<<", "=======", ">>>>>>>"]);
+contains_merge_conflict(Cmd) when is_binary(Cmd) ->
+    contains_merge_conflict(binary_to_list(Cmd));
+contains_merge_conflict(_) -> false.
+
+resolve_conflicts(Content, <<"ours">>) ->
+    resolve_conflicts_with_strategy(Content, ours);
+resolve_conflicts(Content, <<"theirs">>) ->
+    resolve_conflicts_with_strategy(Content, theirs);
+resolve_conflicts(Content, <<"both">>) ->
+    resolve_conflicts_with_strategy(Content, both);
+resolve_conflicts(Content, <<"smart">>) ->
+    resolve_conflicts_with_strategy(Content, smart);
+resolve_conflicts(Content, _) ->
+    resolve_conflicts_with_strategy(Content, smart).
+
+resolve_conflicts_with_strategy(Content, Strategy) ->
+    Lines = binary:split(Content, <<"\n">>, [global]),
+    ResolvedLines = resolve_conflict_lines(Lines, Strategy, [], false, []),
+    iolist_to_binary(lists:join(<<"\n">>, ResolvedLines)).
+
+resolve_conflicts_in_file(FilePath, Strategy) ->
+    case file:read_file(FilePath) of
         {error, Reason} ->
-            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
+            {error, list_to_binary(io_lib:format("Cannot read file: ~p", [Reason]))};
+        {ok, Content} ->
+            Resolved = resolve_conflicts(Content, Strategy),
+            case Resolved =:= Content of
+                true ->
+                    {ok, <<"no_change">>};
+                false ->
+                    case file:write_file(FilePath, Resolved) of
+                        ok ->
+                            {ok, Strategy};
+                        {error, Reason} ->
+                            {error, list_to_binary(io_lib:format("Cannot write file: ~p", [Reason]))}
+                    end
+            end
     end.
 
-run_git_command(Cmd) ->
-    case os:cmd(Cmd ++ " 2>&1") of
-        [] -> #{<<"success">> => true, <<"output">> => <<"">>};
-        Result ->
-            CleanResult = clean_output(Result),
-            #{<<"success">> => true, <<"output">> => CleanResult}
-    end.
-
-run_command_impl(Cmd, Timeout, Cwd) ->
-    % Check for merge conflict markers in command
+run_command_impl(Cmd, _Timeout, Cwd) ->
     case contains_merge_conflict(Cmd) of
         true ->
             #{<<"success">> => false, 
@@ -1640,107 +1096,104 @@ run_command_impl(Cmd, Timeout, Cwd) ->
             end
     end.
 
-contains_merge_conflict(Cmd) when is_list(Cmd) ->
-    lists:any(fun(Pattern) -> string:str(Cmd, Pattern) > 0 end,
-              ["<<<<<<<", "=======", ">>>>>>>"]);
-contains_merge_conflict(Cmd) when is_binary(Cmd) ->
-    contains_merge_conflict(binary_to_list(Cmd));
-contains_merge_conflict(_) -> false.
-
-%% Resolve merge conflicts in a file using the specified strategy
-resolve_conflicts_in_file(FilePath, Strategy) ->
-    case file:read_file(FilePath) of
-        {error, Reason} ->
-            {error, list_to_binary(io_lib:format("Cannot read file: ~p", [Reason]))};
-        {ok, Content} ->
-            Resolved = resolve_conflicts(Content, Strategy),
-            case Resolved =:= Content of
-                true ->
-                    {ok, <<"no_change">>};
-                false ->
-                    case file:write_file(FilePath, Resolved) of
-                        ok ->
-                            {ok, Strategy};
-                        {error, Reason} ->
-                            {error, list_to_binary(io_lib:format("Cannot write file: ~p", [Reason]))}
-                    end
-            end
+detect_change_type(Diff) ->
+    Lines = string:split(Diff, "\n", all),
+    Files = lists:filtermap(fun(Line) ->
+        case string:prefix(Line, "diff --git a/") of
+            nomatch -> false;
+            Rest -> {true, filename:basename(string:trim(Rest))}
+        end
+    end, Lines),
+    HasTest = lists:any(fun(F) -> string:find(F, "test") =/= nomatch end, Files),
+    HasDoc = lists:any(fun(F) -> 
+        string:find(F, "doc") =/= nomatch orelse 
+        lists:suffix("README.md", F) orelse
+        lists:suffix("CHANGELOG.md", F)
+    end, Files),
+    HasNew = string:find(Diff, "new file") =/= nomatch,
+    case {HasTest, HasDoc, HasNew, Files} of
+        {true, _, _, Files} -> {test, Files};
+        {_, true, _, Files} -> {docs, Files};
+        {_, _, true, Files} -> {add, Files};
+        {_, _, _, Files} -> {modify, Files}
     end.
 
-%% Resolve conflicts in content
-resolve_conflicts(Content, <<"ours">>) ->
-    resolve_conflicts_with_strategy(Content, ours);
-resolve_conflicts(Content, <<"theirs">>) ->
-    resolve_conflicts_with_strategy(Content, theirs);
-resolve_conflicts(Content, <<"both">>) ->
-    resolve_conflicts_with_strategy(Content, both);
-resolve_conflicts(Content, <<"smart">>) ->
-    resolve_conflicts_with_strategy(Content, smart);
-resolve_conflicts(Content, _) ->
-    resolve_conflicts_with_strategy(Content, smart).
+analyze_diff(Diff) ->
+    Lines = string:split(Diff, "\n", all),
+    Stats = lists:foldl(fun(Line, {Added, Removed, Files}) ->
+        case Line of
+            "+++" ++ _ -> {Added, Removed, Files};
+            "---" ++ _ -> {Added, Removed, Files};
+            "+" ++ _ -> {Added + 1, Removed, Files};
+            "-" ++ _ -> {Added, Removed + 1, Files};
+            "diff --git " ++ Rest ->
+                File = string:trim(Rest),
+                {Added, Removed, [File | Files]};
+            _ -> {Added, Removed, Files}
+        end
+    end, {0, 0, []}, Lines),
+    {LinesAdded, LinesRemoved, ChangedFiles} = Stats,
+    #{
+        <<"files_changed">> => length(lists:usort(ChangedFiles)),
+        <<"lines_added">> => LinesAdded,
+        <<"lines_removed">> => LinesRemoved,
+        <<"issues">> => detect_issues(Diff),
+        <<"suggestions">> => generate_suggestions(Diff)
+    }.
 
-resolve_conflicts_with_strategy(Content, Strategy) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    ResolvedLines = resolve_conflict_lines(Lines, Strategy, [], false, []),
-    iolist_to_binary(lists:join(<<"\n">>, ResolvedLines)).
+detect_issues(Diff) ->
+    Issues = [],
+    Issues1 = case string:find(Diff, "TODO") =/= nomatch of
+        true -> [<<"Contains TODO comments">> | Issues];
+        false -> Issues
+    end,
+    Issues2 = case string:find(Diff, "FIXME") =/= nomatch of
+        true -> [<<"Contains FIXME comments">> | Issues1];
+        false -> Issues1
+    end,
+    Issues3 = case string:find(Diff, "console.log") =/= nomatch of
+        true -> [<<"Contains console.log statements">> | Issues2];
+        false -> Issues2
+    end,
+    Issues4 = case string:find(Diff, "debugger") =/= nomatch of
+        true -> [<<"Contains debugger statements">> | Issues3];
+        false -> Issues3
+    end,
+    Issues4.
 
-resolve_conflict_lines([], _Strategy, _CurrentBlock, _InConflict, Acc) ->
-    lists:reverse(Acc);
-resolve_conflict_lines([Line | Rest], Strategy, CurrentBlock, InConflict, Acc) ->
-    case {InConflict, binary:match(Line, <<"<<<<<<<">>)} of
-        {false, nomatch} ->
-            resolve_conflict_lines(Rest, Strategy, [], false, [Line | Acc]);
-        {false, _} ->
-            resolve_conflict_lines(Rest, Strategy, [], true, Acc);
-        {true, _} ->
-            case binary:match(Line, <<"=======">>) of
-                nomatch ->
-                    resolve_conflict_lines(Rest, Strategy, [Line | CurrentBlock], true, Acc);
-                _ ->
-                    {Ours, Rest1} = collect_ours_section(CurrentBlock, []),
-                    {Theirs, Rest2} = collect_theirs_section(Rest, []),
-                    ResolvedLine = resolve_conflict_block(Ours, Theirs, Strategy),
-                    resolve_conflict_lines(Rest2, Strategy, [], false, [ResolvedLine | Acc])
-            end
-    end.
+generate_suggestions(Diff) ->
+    Suggestions = [],
+    Sug1 = case string:find(Diff, "password") =/= nomatch orelse 
+              string:find(Diff, "secret") =/= nomatch orelse
+              string:find(Diff, "api_key") =/= nomatch of
+        true -> [<<"Review for potential hardcoded secrets">> | Suggestions];
+        false -> Suggestions
+    end,
+    Sug2 = case string:find(Diff, "print") =/= nomatch orelse
+              string:find(Diff, "io:format") =/= nomatch of
+        true -> [<<"Consider removing debug print statements">> | Sug1];
+        false -> Sug1
+    end,
+    Sug2.
 
-collect_ours_section([], Acc) -> {lists:reverse(Acc), []};
-collect_ours_section([Line | Rest], Acc) ->
-    case binary:match(Line, <<"=======">>) of
-        nomatch -> collect_ours_section(Rest, [Line | Acc]);
-        _ -> {lists:reverse(Acc), Rest}
-    end.
+format_undo_results(Results) when is_list(Results) ->
+    lists:map(fun
+        ({ok, OpId}) -> #{<<"status">> => <<"ok">>, <<"operation_id">> => OpId};
+        ({error, Path, Reason}) -> #{<<"status">> => <<"error">>, <<"path">> => list_to_binary(Path), <<"reason">> => list_to_binary(io_lib:format("~p", [Reason]))};
+        ({error, Err}) -> #{<<"status">> => <<"error">>, <<"reason">> => list_to_binary(io_lib:format("~p", [Err]))}
+    end, Results);
+format_undo_results(_) ->
+    [].
 
-collect_theirs_section([], Acc) -> {lists:reverse(Acc), []};
-collect_theirs_section([Line | Rest], Acc) ->
-    case binary:match(Line, <<">>>>>>>">>) of
-        nomatch -> collect_theirs_section(Rest, [Line | Acc]);
-        _ -> {lists:reverse(Acc), Rest}
-    end.
-
-resolve_conflict_block(Ours, Theirs, ours) ->
-    iolist_to_binary(lists:join(<<"\n">>, Ours));
-resolve_conflict_block(Ours, Theirs, theirs) ->
-    iolist_to_binary(lists:join(<<"\n">>, Theirs));
-resolve_conflict_block(Ours, Theirs, both) ->
-    All = Ours ++ Theirs,
-    iolist_to_binary(lists:join(<<"\n">>, All));
-resolve_conflict_block(Ours, Theirs, smart) ->
-    case {Ours, Theirs} of
-        {[], Theirs} -> iolist_to_binary(lists:join(<<"\n">>, Theirs));
-        {Ours, []} -> iolist_to_binary(lists:join(<<"\n">>, Ours));
-        {Ours, Theirs} ->
-            OursContent = iolist_to_binary(lists:join(<<"\n">>, Ours)),
-            TheirsContent = iolist_to_binary(lists:join(<<"\n">>, Theirs)),
-            HasImport = fun(C) -> binary:match(C, <<"import">>) =/= nomatch 
-                                      orelse binary:match(C, <<"-include">>) =/= nomatch end,
-            case {byte_size(TheirsContent) > byte_size(OursContent),
-                  HasImport(TheirsContent), HasImport(OursContent)} of
-                {true, _, _} -> TheirsContent;
-                {false, true, false} -> TheirsContent;
-                {false, false, true} -> OursContent;
-                _ -> OursContent
-            end
+limit_grep_output(Output, MaxLines) when is_binary(Output) ->
+    Lines = binary:split(Output, <<"\n">>, [global]),
+    case length(Lines) > MaxLines of
+        true ->
+            Limited = lists:sublist(Lines, MaxLines),
+            Omitted = length(Lines) - MaxLines,
+            iolist_to_binary([Limited, <<"\n... (">>, integer_to_binary(Omitted), <<" more lines omitted)">>]);
+        false ->
+            Output
     end.
 
 clean_output(String) when is_binary(String) ->
@@ -1757,11 +1210,9 @@ clean_output(String) when is_binary(String) ->
         _ -> Cleaned
     end;
 clean_output(String) when is_list(String) ->
-    % Check if it's a printable string
     MaxSize = 50000,
     case io_lib:printable_unicode_list(String) of
         true -> 
-            % It's a string - convert to binary and clean
             try
                 Bin = unicode:characters_to_binary(String),
                 Cleaned = re:replace(Bin, "\\x1b\\[[0-9;]*[a-zA-Z]", "", [global, {return, binary}]),
@@ -1773,7 +1224,6 @@ clean_output(String) when is_list(String) ->
                 end
             catch
                 _:_ -> 
-                    % Fallback - just truncate the original
                     try
                         Len = length(String),
                         case Len > MaxSize of
@@ -1786,16 +1236,13 @@ clean_output(String) when is_list(String) ->
                     end
             end;
         false ->
-            % It's a nested structure - return as formatted string
             case String of
                 [] -> <<"[]">>;
                 _ when is_list(hd(String)) ->
-                    % Nested list - limit depth and size
                     MaxItems = 100,
                     Limited = lists:sublist(String, MaxItems),
                     unicode:characters_to_binary(io_lib:format("[list of ~p items, showing first ~p]", [length(String), length(Limited)]));
                 _ ->
-                    % Flat list but not printable - format safely
                     try
                         unicode:characters_to_binary(io_lib:format("~w", [String]))
                     catch
@@ -1804,7 +1251,6 @@ clean_output(String) when is_list(String) ->
             end
     end;
 clean_output(Other) ->
-    % Fallback for any other type - format and truncate
     try
         Bin = iolist_to_binary(io_lib:format("~p", [Other])),
         MaxSize = 50000,
@@ -1818,6 +1264,10 @@ clean_output(Other) ->
         _:_ -> <<"[error serializing result]">>
     end.
 
+%%===================================================================
+%% Internal helpers (not exported — used by backup API and conflict resolution)
+%%===================================================================
+
 create_backup_internal(Path) ->
     BackupDir = ?BACKUP_DIR,
     case filelib:is_dir(BackupDir) of
@@ -1830,7 +1280,6 @@ create_backup_internal(Path) ->
     case file:copy(Path, BackupPath) of
         {ok, _} ->
             cleanup_old_backups(),
-            % Push to undo stack if available
             push_to_undo_stack(Path, BackupPath),
             {ok, BackupPath};
         {error, Reason} -> {error, file:format_error(Reason)}
@@ -1839,7 +1288,7 @@ create_backup_internal(Path) ->
 push_to_undo_stack(Path, BackupPath) ->
     case whereis(coding_agent_undo) of
         undefined -> 
-            ok;  % Undo server not started, skip
+            ok;
         _Pid ->
             Op = #{
                 type => edit,
@@ -1887,999 +1336,61 @@ cleanup_old_backups() ->
             end
     end.
 
-detect_project_impl(Path) ->
-    Checks = [
-        {"rebar.config", "Erlang/OTP (Rebar3)"},
-        {"package.json", "Node.js"},
-        {"Cargo.toml", "Rust"},
-        {"go.mod", "Go"},
-        {"pom.xml", "Java (Maven)"},
-        {"build.gradle", "Java (Gradle)"},
-        {"requirements.txt", "Python"},
-        {"pyproject.toml", "Python"},
-        {"Gemfile", "Ruby"},
-        {"composer.json", "PHP"},
-        {"mix.exs", "Elixir"}
-    ],
-    Results = lists:filtermap(fun({File, Type}) ->
-        FullPath = filename:join(Path, File),
-        case filelib:is_file(FullPath) of
-            true -> {true, #{
-                <<"file">> => list_to_binary(File),
-                <<"type">> => list_to_binary(Type)
-            }};
-            false -> false
-        end
-    end, Checks),
-    
-    IsGit = filelib:is_dir(filename:join(Path, ".git")),
-    
-    #{
-        <<"success">> => true,
-        <<"project_types">> => Results,
-        <<"is_git_repo">> => IsGit,
-        <<"detected">> => length(Results) > 0
-    }.
-
-create_backup(Path) when is_list(Path) ->
-    create_backup_internal(Path).
-
-restore_backup(Path) when is_list(Path) ->
-    restore_backup_internal(Path).
-
-list_backups() ->
-    list_backups_impl().
-
-clear_backups() ->
-    BackupDir = ?BACKUP_DIR,
-    case filelib:is_dir(BackupDir) of
-        false -> ok;
-        true ->
-            Files = filelib:wildcard(filename:join(BackupDir, "*")),
-            lists:foreach(fun(F) -> file:delete(F) end, Files)
-    end.
-
-% Helper functions for smart_commit
-generate_commit_message(Diff) ->
-    % Parse diff and generate meaningful commit message
-    Lines = string:split(Diff, "\n", all),
-    AddedFiles = [Line || Line <- Lines, string:prefix(Line, "diff --git ") =/= nomatch],
-    AddedCount = length(AddedFiles),
-    
-    % Detect change type
-    ChangeType = detect_change_type(Diff),
-    
-    % Generate message based on patterns
-    Msg = case ChangeType of
-        {add, Files} when Files =/= [] ->
-            iolist_to_binary(io_lib:format("Add ~p new file(s): ~s", [length(Files), string:join(Files, ", ")]));
-        {modify, Files} when Files =/= [] ->
-            iolist_to_binary(io_lib:format("Update ~p file(s): ~s", [length(Files), string:join(Files, ", ")]));
-        {refactor, _} ->
-            <<"Refactor code structure">>;
-        {fix, _} ->
-            <<"Fix bugs and issues">>;
-        {feature, _} ->
-            <<"Add new feature">>;
-        {docs, _} ->
-            <<"Update documentation">>;
-        {test, _} ->
-            <<"Add or update tests">>;
-        _ ->
-            iolist_to_binary(io_lib:format("Update ~p file(s)", [AddedCount]))
-    end,
-    Msg.
-
-detect_change_type(Diff) ->
-    Lines = string:split(Diff, "\n", all),
-    Files = lists:filtermap(fun(Line) ->
-        case string:prefix(Line, "diff --git a/") of
-            nomatch -> false;
-            Rest -> {true, filename:basename(string:trim(Rest))}
-        end
-    end, Lines),
-    
-    % Check for patterns
-    HasTest = lists:any(fun(F) -> string:find(F, "test") =/= nomatch end, Files),
-    HasDoc = lists:any(fun(F) -> 
-        string:find(F, "doc") =/= nomatch orelse 
-        lists:suffix("README.md", F) orelse
-        lists:suffix("CHANGELOG.md", F)
-    end, Files),
-    HasNew = string:find(Diff, "new file") =/= nomatch,
-    
-    case {HasTest, HasDoc, HasNew, Files} of
-        {true, _, _, Files} -> {test, Files};
-        {_, true, _, Files} -> {docs, Files};
-        {_, _, true, Files} -> {add, Files};
-        {_, _, _, Files} -> {modify, Files}
-    end.
-
-analyze_diff(Diff) ->
-    Lines = string:split(Diff, "\n", all),
-    Stats = lists:foldl(fun(Line, {Added, Removed, Files}) ->
-        case Line of
-            "+++" ++ _ -> {Added, Removed, Files};
-            "---" ++ _ -> {Added, Removed, Files};
-            "+" ++ _ -> {Added + 1, Removed, Files};
-            "-" ++ _ -> {Added, Removed + 1, Files};
-            "diff --git " ++ Rest ->
-                File = string:trim(Rest),
-                {Added, Removed, [File | Files]};
-            _ -> {Added, Removed, Files}
-        end
-    end, {0, 0, []}, Lines),
-    
-    {LinesAdded, LinesRemoved, ChangedFiles} = Stats,
-    
-    #{
-        <<"files_changed">> => length(lists:usort(ChangedFiles)),
-        <<"lines_added">> => LinesAdded,
-        <<"lines_removed">> => LinesRemoved,
-        <<"issues">> => detect_issues(Diff),
-        <<"suggestions">> => generate_suggestions(Diff)
-    }.
-
-detect_issues(Diff) ->
-    Issues = [],
-    
-    % Check for common issues
-    Issues1 = case string:find(Diff, "TODO") =/= nomatch of
-        true -> [<<"Contains TODO comments">> | Issues];
-        false -> Issues
-    end,
-    
-    Issues2 = case string:find(Diff, "FIXME") =/= nomatch of
-        true -> [<<"Contains FIXME comments">> | Issues1];
-        false -> Issues1
-    end,
-    
-    Issues3 = case string:find(Diff, "console.log") =/= nomatch of
-        true -> [<<"Contains console.log statements">> | Issues2];
-        false -> Issues2
-    end,
-    
-    Issues4 = case string:find(Diff, "debugger") =/= nomatch of
-        true -> [<<"Contains debugger statements">> | Issues3];
-        false -> Issues3
-    end,
-    
-    Issues4.
-
-generate_suggestions(Diff) ->
-    Suggestions = [],
-    
-    % Check for improvement opportunities
-    Sug1 = case string:find(Diff, "password") =/= nomatch orelse 
-              string:find(Diff, "secret") =/= nomatch orelse
-              string:find(Diff, "api_key") =/= nomatch of
-        true -> [<<"Review for potential hardcoded secrets">> | Suggestions];
-        false -> Suggestions
-    end,
-    
-    Sug2 = case string:find(Diff, "print") =/= nomatch orelse
-              string:find(Diff, "io:format") =/= nomatch of
-        true -> [<<"Consider removing debug print statements">> | Sug1];
-        false -> Sug1
-    end,
-    
-    Sug2.
-
-generate_review_summary(Diff) ->
-    Stats = analyze_diff(Diff),
-    Files = maps:get(<<"files_changed">>, Stats, 0),
-    Added = maps:get(<<"lines_added">>, Stats, 0),
-    Removed = maps:get(<<"lines_removed">>, Stats, 0),
-    Issues = maps:get(<<"issues">>, Stats, []),
-    
-    Summary = io_lib:format("Changed ~p files (+~p/-~p lines).", [Files, Added, Removed]),
-    
-    case Issues of
-        [] -> iolist_to_binary(Summary);
-        _ -> 
-            IssueList = lists:map(fun(I) -> binary_to_list(I) end, Issues),
-            iolist_to_binary([Summary, " Issues: ", string:join(IssueList, ", ")])
-    end.
-
-% Test generation helpers
-extract_all_functions(Content, FilePath) ->
-    Ext = filename:extension(FilePath),
-    extract_functions_by_ext(Ext, Content).
-
-extract_functions_by_ext(".erl", Content) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    lists:filtermap(fun(Line) ->
-        case re:run(Line, "^([a-z][a-zA-Z0-9_@]*)\\s*\\(", [{capture, [1], binary}]) of
-            {match, [Name]} -> {true, binary_to_list(Name)};
-            _ -> false
-        end
-    end, Lines);
-extract_functions_by_ext(".ex", Content) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    lists:filtermap(fun(Line) ->
-        case re:run(Line, "^\\s*defp?\\s+([a-z_][a-zA-Z0-9_?!]*)", [{capture, [1], binary}]) of
-            {match, [Name]} -> {true, binary_to_list(Name)};
-            _ -> false
-        end
-    end, Lines);
-extract_functions_by_ext(_, _) -> [].
-
-generate_function_tests(FuncName, Content, FilePath, Framework) ->
-    Ext = filename:extension(FilePath),
-    generate_tests_by_ext(Ext, FuncName, Content, Framework).
-
-generate_tests_by_ext(".erl", FuncName, _Content, <<"eunit">>) ->
-    #{
-        <<"function">> => list_to_binary(FuncName),
-        <<"tests">> => [
-            generate_test_case(FuncName, "with valid input"),
-            generate_test_case(FuncName, "with edge cases"),
-            generate_test_case(FuncName, "with invalid input")
-        ],
-        <<"code">> => iolist_to_binary(io_lib:format("~s_test() ->~n    % TODO: Add test cases~n    ok.~n", [FuncName]))
-    };
-generate_tests_by_ext(".ex", FuncName, _Content, <<"exunit">>) ->
-    #{
-        <<"function">> => list_to_binary(FuncName),
-        <<"tests">> => [
-            <<"test with valid input">>,
-            <<"test with edge cases">>,
-            <<"test with invalid input">>
-        ],
-        <<"code">> => iolist_to_binary(io_lib:format("test \"~s with valid input\" do~n  # TODO: Add test~nend~n", [FuncName]))
-    };
-generate_tests_by_ext(_, FuncName, _Content, _) ->
-    #{
-        <<"function">> => list_to_binary(FuncName),
-        <<"tests">> => [<<"test case">>],
-        <<"code">> => <<"TODO: Add tests">>
-    }.
-
-generate_test_case(FuncName, Description) ->
-    iolist_to_binary(io_lib:format("~s_~s_test() ->~n    ?assert(true).", [FuncName, string:replace(Description, " ", "_")])).
-
-generate_test_file(FilePath, Tests, Framework) ->
-    Ext = filename:extension(FilePath),
-    TestFileName = generate_test_filename(FilePath, Ext),
-    TestContent = generate_test_content(Ext, Framework, Tests),
-    #{
-        <<"path">> => TestFileName,
-        <<"content">> => TestContent
-    }.
-
-generate_test_filename(FilePath, ".erl") when is_binary(FilePath) ->
-    BaseName = binary_to_list(filename:basename(binary_to_list(FilePath), ".erl")),
-    Dir = binary_to_list(filename:dirname(binary_to_list(FilePath))),
-    list_to_binary(filename:join([Dir, "..", "test", BaseName ++ "_tests.erl"]));
-generate_test_filename(FilePath, ".ex") when is_binary(FilePath) ->
-    BaseName = binary_to_list(filename:basename(binary_to_list(FilePath), ".ex")),
-    Dir = binary_to_list(filename:dirname(binary_to_list(FilePath))),
-    list_to_binary(filename:join([Dir, "..", "test", BaseName ++ "_test.exs"]));
-generate_test_filename(FilePath, _) when is_binary(FilePath) ->
-    BaseName = binary_to_list(filename:basename(binary_to_list(FilePath))),
-    Dir = binary_to_list(filename:dirname(binary_to_list(FilePath))),
-    list_to_binary(filename:join([Dir, "..", "test", "test_" ++ BaseName]));
-generate_test_filename(FilePath, Ext) when is_list(FilePath) ->
-    generate_test_filename(list_to_binary(FilePath), Ext).
-
-generate_test_content(".erl", <<"eunit">>, Tests) ->
-    Includes = <<"-include_lib(\"eunit/include/eunit.hrl\").\n\n">>,
-    TestCodes = lists:map(fun(T) -> maps:get(<<"code">>, T, <<>>) end, Tests),
-    iolist_to_binary([Includes | TestCodes]);
-generate_test_content(".ex", <<"exunit">>, Tests) ->
-    Includes = <<"defmodule Test do\n  use ExUnit.Case\n\n">>,
-    TestCodes = lists:map(fun(T) -> maps:get(<<"code">>, T, <<>>) end, Tests),
-    iolist_to_binary([Includes | TestCodes] ++ [<<"\nend\n">>]);
-generate_test_content(_, _, Tests) ->
-    TestCodes = lists:map(fun(T) -> maps:get(<<"code">>, T, <<>>) end, Tests),
-    iolist_to_binary(TestCodes).
-% Documentation Generation Implementation
-generate_module_docs(Content, FilePath, Style) ->
-    Ext = filename:extension(FilePath),
-    Functions = extract_all_functions(Content, FilePath),
-    ModuleName = filename:basename(FilePath, filename:extension(FilePath)),
-    
-    DocStrings = lists:map(fun(FuncName) ->
-        generate_doc_string(FuncName, Content, Style)
-    end, Functions),
-    
-    case Style of
-        <<"exdoc">> ->
-            generate_exdoc_header(ModuleName, DocStrings);
-        _ ->
-            generate_edoc_header(ModuleName, DocStrings)
-    end.
-
-generate_function_docs(FuncName, Content, FilePath, Style) ->
-    generate_doc_string(FuncName, Content, Style).
-
-generate_doc_string(FuncName, Content, Style) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    case find_function_lines(FuncName, Lines) of
-        {StartLine, EndLine} ->
-            FuncCode = extract_function_code(Lines, StartLine, EndLine),
-            analyze_function_for_docs(FuncName, FuncCode, Style);
-        not_found ->
-            #{<<"function">> => list_to_binary(FuncName), <<"doc">> => <<"Function not found">>}
-    end.
-
-find_function_lines(FuncName, Lines) ->
-    Pattern = "^" ++ FuncName ++ "\\s*\\(",
-    find_function_lines(FuncName, Lines, 1, undefined, false).
-
-find_function_lines(_FuncName, [], _Line, _Start, false) ->
-    not_found;
-find_function_lines(FuncName, [Line | Rest], LineNum, Start, InFunc) ->
-    case InFunc of
-        true ->
-            case is_function_end(Line) of
-                true -> {Start, LineNum};
-                false -> find_function_lines(FuncName, Rest, LineNum + 1, Start, true)
-            end;
-        false ->
-            case re:run(Line, "^([a-z][a-zA-Z0-9_@]*)\\s*\\(", [{capture, [1], binary}]) of
-                {match, [FuncNameBin]} ->
-                    case FuncNameBin == list_to_binary(FuncName) of
-                        true -> find_function_lines(FuncName, Rest, LineNum + 1, LineNum, true);
-                        false -> find_function_lines(FuncName, Rest, LineNum + 1, Start, false)
-                    end;
-                _ ->
-                    find_function_lines(FuncName, Rest, LineNum + 1, Start, false)
-            end
-    end.
-
-is_function_end(Line) ->
-    case Line of
-        "." ++ _ -> true;
-        _ -> false
-    end.
-
-extract_function_code(Lines, StartLine, EndLine) ->
-    FuncLines = lists:sublist(Lines, StartLine, EndLine - StartLine + 1),
-    list_to_binary(string:join([binary_to_list(L) || L <- FuncLines], "\n")).
-
-analyze_function_for_docs(FuncName, FuncCode, Style) ->
-    % Analyze function signature and body to infer doc
-    Arity = infer_arity(FuncCode),
-    Params = extract_params(FuncCode),
-    Returns = infer_return_type(FuncCode),
-    
-    DocText = generate_doc_from_analysis(FuncName, Params, Returns, Style),
-    
-    #{
-        <<"function">> => list_to_binary(FuncName),
-        <<"arity">> => Arity,
-        <<"params">> => Params,
-        <<"returns">> => Returns,
-        <<"doc">> => DocText,
-        <<"style">> => Style
-    }.
-
-infer_arity(Code) ->
-    case re:run(Code, "\\(([A-Z][a-zA-Z0-9_]*(?:\\s*,\\s*[A-Z][a-zA-Z0-9_]*)*)\\)", [{capture, [1], binary}]) of
-        {match, [Params]} ->
-            ParamList = binary:split(Params, <<",">>, [global]),
-            length(ParamList);
-        nomatch ->
-            case re:run(Code, "\\(\\)", []) of
-                {match, _} -> 0;
-                nomatch -> 0
-            end
-    end.
-
-extract_params(Code) ->
-    case re:run(Code, "\\(([A-Z][a-zA-Z0-9_]*(?:\\s*,\\s*[A-Z][a-zA-Z0-9_]*)*)\\)", [{capture, [1], binary}]) of
-        {match, [Params]} ->
-            ParamList = binary:split(Params, <<",">>, [global]),
-            [binary:trim(P) || P <- ParamList];
-        nomatch -> []
-    end.
-
-infer_return_type(Code) ->
-    % Simple heuristics for return type
-    case Code of
-        _ when byte_size(Code) > 0 ->
-            case re:run(Code, "\\{([^}]+)\\}") of
-                {match, _} -> <<"tuple">>;
+resolve_conflict_lines([], _Strategy, _CurrentBlock, _InConflict, Acc) ->
+    lists:reverse(Acc);
+resolve_conflict_lines([Line | Rest], Strategy, CurrentBlock, InConflict, Acc) ->
+    case {InConflict, binary:match(Line, <<"<<<<<<<">>)} of
+        {false, nomatch} ->
+            resolve_conflict_lines(Rest, Strategy, [], false, [Line | Acc]);
+        {false, _} ->
+            resolve_conflict_lines(Rest, Strategy, [], true, Acc);
+        {true, _} ->
+            case binary:match(Line, <<"=======">>) of
                 nomatch ->
-                    case re:run(Code, "\\[") of
-                        {match, _} -> <<"list">>;
-                        nomatch ->
-                            case re:run(Code, "true|false") of
-                                {match, _} -> <<"boolean">>;
-                                nomatch -> <<"term()">>
-                            end
-                    end
-            end;
-        _ -> <<"term()">>
-    end.
-
-generate_doc_from_analysis(FuncName, Params, Returns, <<"edoc">>) ->
-    ParamDocs = [io_lib:format("%% @param ~s Description", [P]) || P <- Params],
-    ReturnDoc = io_lib:format("%% @returns ~s", [Returns]),
-    iolist_to_binary(string:join(ParamDocs ++ [ReturnDoc], "\n"));
-generate_doc_from_analysis(FuncName, Params, Returns, <<"exdoc">>) ->
-    ParamDocs = [io_lib:format("  * `~s` - Description", [P]) || P <- Params],
-    iolist_to_binary(string:join(["```erlang"] ++ ParamDocs ++ ["```", "Returns: " ++ binary_to_list(Returns)], "\n"));
-generate_doc_from_analysis(FuncName, Params, Returns, _) ->
-    iolist_to_binary(io_lib:format("Function: ~s(~s) -> ~s", [FuncName, string:join([binary_to_list(P) || P <- Params], ", "), Returns])).
-
-generate_edoc_header(ModuleName, DocStrings) ->
-    ModuleDoc = io_lib:format("%% @doc TODO: Add module documentation\n-module(~s).\n", [ModuleName]),
-    FuncDocs = [io_lib:format("\n%% ~s\n~s(~s) ->\n    TODO.\n", 
-                              [maps:get(<<"doc">>, D, <<"">>), 
-                               maps:get(<<"function">>, D, <<>>),
-                               string:join([binary_to_list(P) || P <- maps:get(<<"params">>, D, [])], ", ")])
-                 || D <- DocStrings],
-    iolist_to_binary([ModuleDoc | FuncDocs]).
-
-generate_exdoc_header(ModuleName, DocStrings) ->
-    ModuleDoc = io_lib:format("@moduledoc \"\"\"TODO: Add module documentation\"\"\"\n\ndefmodule ~s do\n", [ModuleName]),
-    FuncDocs = [io_lib:format("\n  @doc \"\"\"~s\"\"\"\n  def ~s(~s) do\n    # TODO: Implement\n  end\n",
-                              [maps:get(<<"doc">>, D, <<"">>),
-                               maps:get(<<"function">>, D, <<>>),
-                               string:join([binary_to_list(P) || P <- maps:get(<<"params">>, D, [])], ", ")])
-                 || D <- DocStrings],
-    EndModule = "\nend\n",
-    iolist_to_binary([ModuleDoc | FuncDocs] ++ [EndModule]).
-
-% Web Docs Fetcher Implementation
-fetch_package_docs(Package, Language, Version) ->
-    case fetch_docs_impl(binary_to_list(Language), binary_to_list(Package), Version) of
-        {ok, Docs} -> #{<<"success">> => true, <<"docs">> => Docs};
-        {error, Reason} -> #{<<"success">> => false, <<"error">> => list_to_binary(Reason)}
-    end.
-
-fetch_docs_impl("erlang", Package, Version) ->
-    Url = "https://hex.pm/api/packages/" ++ Package,
-    fetch_hex_docs(Url);
-fetch_docs_impl("elixir", Package, Version) ->
-    Url = "https://hex.pm/api/packages/" ++ Package,
-    fetch_hex_docs(Url);
-fetch_docs_impl("npm", Package, Version) ->
-    Url = "https://registry.npmjs.org/" ++ Package,
-    fetch_npm_docs(Url);
-fetch_docs_impl("python", Package, Version) ->
-    Url = "https://pypi.org/pypi/" ++ Package ++ "/json",
-    fetch_pypi_docs(Url);
-fetch_docs_impl("rust", Package, Version) ->
-    Url = "https://crates.io/api/v1/crates/" ++ Package,
-    fetch_crates_docs(Url);
-fetch_docs_impl(Lang, Package, _Version) ->
-    {error, "Unsupported language: " ++ Lang}.
-
-fetch_hex_docs(Url) ->
-    fetch_url(Url, [
-        {parse_info, fun(Body) ->
-            case jsx:is_json(Body) of
-                true ->
-                    Data = jsx:decode(Body, [return_maps]),
-                    Name = maps:get(<<"name">>, Data, <<>>),
-                    #{
-                        <<"name">> => Name,
-                        <<"description">> => maps:get(<<"description">>, Data, <<>>),
-                        <<"version">> => maps:get(<<"latest_version">>, Data, <<>>),
-                        <<"docs_url">> => maps:get(<<"docs_html_url">>, Data, <<>>),
-                        <<"hex_url">> => <<"https://hex.pm/packages/", Name/binary>>
-                    };
-                false -> #{<<"error">> => <<"Failed to parse response">>}
-            end
-        end}]).
-
-fetch_npm_docs(Url) ->
-    fetch_url(Url, []).
-
-fetch_pypi_docs(Url) ->
-    fetch_url(Url, []).
-
-fetch_crates_docs(Url) ->
-    fetch_url(Url, []).
-
-fetch_url(Url, _Opts) ->
-    case hackney:get(Url, [], <<>>, [{follow_redirect, true}, {recv_timeout, 10000}]) of
-        {ok, 200, _Headers, Body} ->
-            SafeBody = safe_binary(Body),
-            case jsx:is_json(SafeBody) of
-                true ->
-                    Data = jsx:decode(SafeBody, [return_maps]),
-                    #{
-                        <<"success">> => true,
-                        <<"name">> => maps:get(<<"name">>, Data, <<>>),
-                        <<"description">> => safe_binary(maps:get(<<"description">>, Data, <<>>)),
-                        <<"version">> => maps:get(<<"version">>, Data, maps:get(<<"latest_version">>, Data, <<>>)),
-                        <<"url">> => list_to_binary(Url)
-                    };
-                false ->
-                    #{<<"success">> => true, <<"content">> => SafeBody, <<"url">> => list_to_binary(Url)}
-            end;
-        {ok, Status, _Headers, _Body} ->
-            {error, "HTTP error: " ++ integer_to_list(Status)};
-        {error, Reason} ->
-            {error, "Request failed: " ++ atom_to_list(Reason)}
-    end.
-
-% Refactoring Implementation
-rename_in_file(FilePath, OldName, NewName, Content) ->
-    _ = create_backup_internal(FilePath),
-    
-    % Simple token-based rename (preserves exact matches)
-    ContentList = binary_to_list(Content),
-    Pattern = "\\b" ++ OldName ++ "\\b",
-    {ok, MP} = re:compile(Pattern),
-    NewContent = re:replace(ContentList, MP, NewName, [global, {return, list}]),
-    
-    case file:write_file(FilePath, list_to_binary(NewContent)) of
-        ok -> 
-            #{
-                <<"success">> => true,
-                <<"file">> => list_to_binary(FilePath),
-                <<"old_name">> => list_to_binary(OldName),
-                <<"new_name">> => list_to_binary(NewName),
-                <<"scope">> => <<"file">>
-            };
-        {error, Reason} ->
-            restore_backup_internal(FilePath),
-            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
-    end.
-
-rename_in_project(FilePath, OldName, NewName) ->
-    % Find all files in project
-    Ext = filename:extension(FilePath),
-    Files = case Ext of
-        ".erl" -> filelib:wildcard("src/**/*.erl");
-        ".ex" -> filelib:wildcard("lib/**/*.ex");
-        _ -> filelib:wildcard("**/*" ++ Ext)
-    end,
-    
-    Results = lists:filtermap(fun(F) ->
-        case file:read_file(F) of
-            {ok, Content} ->
-                case re:run(Content, "\\b" ++ OldName ++ "\\b") of
-                    {match, _} ->
-                        case rename_in_file(F, OldName, NewName, Content) of
-                            #{<<"success">> := true} = Result -> {true, Result};
-                            Error -> {true, Error}
-                        end;
-                    nomatch -> false
-                end;
-            _ -> false
-        end
-    end, Files),
-    
-    #{
-        <<"success">> => true,
-        <<"old_name">> => list_to_binary(OldName),
-        <<"new_name">> => list_to_binary(NewName),
-        <<"files_modified">> => length(Results),
-        <<"changes">> => Results
-    }.
-
-extract_function_impl(FilePath, Content, StartLine, EndLine, FuncName) ->
-    _ = create_backup_internal(FilePath),
-    
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    ExtractedLines = lists:sublist(Lines, StartLine, EndLine - StartLine + 1),
-    ExtractedCode = string:join([binary_to_list(L) || L <- ExtractedLines], "\n"),
-    
-    % Infer parameters from extracted code
-    Params = extract_params(list_to_binary(ExtractedCode)),
-    ParamList = string:join([binary_to_list(P) || P <- Params], ", "),
-    
-    % Create new function
-    NewFunc = io_lib:format("~s(~s) ->\n~s.\n", [FuncName, ParamList, "    " ++ ExtractedCode]),
-    
-    % Insert new function after extracted code
-    BeforeLines = lists:sublist(Lines, 1, StartLine - 1),
-    AfterLines = lists:sublist(Lines, EndLine + 1, length(Lines) - EndLine),
-    CallCode = io_lib:format("~s(~s)", [FuncName, ParamList]),
-    
-    NewContent = string:join([binary_to_list(L) || L <- BeforeLines] ++ [CallCode] ++ [binary_to_list(L) || L <- AfterLines], "\n"),
-    
-    % Write modified content
-    case file:write_file(FilePath, list_to_binary(NewContent)) of
-        ok ->
-            #{
-                <<"success">> => true,
-                <<"file">> => list_to_binary(FilePath),
-                <<"new_function">> => list_to_binary(FuncName),
-                <<"function_code">> => list_to_binary(NewFunc),
-                <<"lines_extracted">> => EndLine - StartLine + 1
-            };
-        {error, Reason} ->
-            restore_backup_internal(FilePath),
-            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
-    end.
-
-% Multi-file Context Implementation
-load_smart_context(FilePath, IncludeTests, IncludeDeps, MaxFiles) ->
-    case file:read_file(FilePath) of
-        {ok, Content} ->
-            % Find imports and dependencies
-            Imports = extract_imports(FilePath, Content),
-            RelatedFiles = find_related_files(FilePath, Imports, IncludeTests, MaxFiles),
-            
-            % Load content of related files
-            LoadedFiles = lists:filtermap(fun(RelPath) ->
-                case file:read_file(RelPath) of
-                    {ok, RelContent} -> 
-                        {true, #{
-                            <<"path">> => list_to_binary(RelPath),
-                            <<"content">> => RelContent,
-                            <<"relation">> => determine_relation(RelPath, FilePath)
-                        }};
-                    _ -> false
-                end
-            end, RelatedFiles),
-            
-            #{
-                <<"success">> => true,
-                <<"primary_file">> => list_to_binary(FilePath),
-                <<"related_files">> => LoadedFiles,
-                <<"imports">> => Imports
-            };
-        {error, Reason} ->
-            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
-    end.
-
-extract_imports(FilePath, Content) ->
-    Ext = filename:extension(FilePath),
-    extract_imports_by_ext(Ext, Content, FilePath).
-
-extract_imports_by_ext(".erl", Content, _FilePath) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    lists:filtermap(fun(Line) ->
-        case re:run(Line, "-include_lib\\(\"([^\"]+)\"", [{capture, [1], binary}]) of
-            {match, [Lib]} -> {true, Lib};
-            _ ->
-                case re:run(Line, "-include\\(\"([^\"]+)\"", [{capture, [1], binary}]) of
-                    {match, [Inc]} -> {true, Inc};
-                    _ -> false
-                end
-        end
-    end, Lines);
-
-extract_imports_by_ext(".ex", Content, _FilePath) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    lists:filtermap(fun(Line) ->
-        case re:run(Line, "use\\s+([A-Z][a-zA-Z.]+)", [{capture, [1], binary}]) of
-            {match, [Module]} -> {true, Module};
-            _ ->
-                case re:run(Line, "import\\s+([A-Z][a-zA-Z.]+)", [{capture, [1], binary}]) of
-                    {match, [Module]} -> {true, Module};
-                    _ -> false
-                end
-        end
-    end, Lines);
-
-extract_imports_by_ext(_, _, _) -> [].
-
-find_related_files(FilePath, Imports, IncludeTests, MaxFiles) ->
-    Dir = filename:dirname(FilePath),
-    Ext = filename:extension(FilePath),
-    
-    % Find files matching imports
-    ImportFiles = find_import_files(Imports, Dir, Ext),
-    
-    % Find test files
-    TestFiles = case IncludeTests of
-        true -> find_test_files(FilePath);
-        false -> []
-    end,
-    
-    % Merge and limit
-    AllFiles = lists:usort(ImportFiles ++ TestFiles),
-    lists:sublist(AllFiles, MaxFiles).
-
-find_import_files(Imports, Dir, Ext) ->
-    lists:filtermap(fun(Import) ->
-        case Ext of
-            ".erl" ->
-                % Convert module name to file path
-                ModulePath = string:replace(binary_to_list(Import), ".", "/") ++ ".erl",
-                FullPath = filename:join([Dir, ModulePath]),
-                case filelib:is_file(FullPath) of
-                    true -> {true, FullPath};
-                    _ -> false
-                end;
-            ".ex" ->
-                ModulePath = string:replace(binary_to_list(Import), ".", "/") ++ ".ex",
-                FullPath = filename:join([Dir, "lib", ModulePath]),
-                case filelib:is_file(FullPath) of
-                    true -> {true, FullPath};
-                    _ -> false
-                end;
-            _ -> false
-        end
-    end, Imports).
-
-find_test_files(FilePath) ->
-    BaseName = filename:basename(FilePath, filename:extension(FilePath)),
-    Ext = filename:extension(FilePath),
-    
-    TestPattern = case Ext of
-        ".erl" -> "**/" ++ BaseName ++ "_tests.erl";
-        ".ex" -> "**/" ++ BaseName ++ "_test.exs";
-        _ -> "**/test_" ++ BaseName ++ "*"
-    end,
-    
-    filelib:wildcard(TestPattern).
-
-determine_relation(RelPath, PrimaryPath) ->
-    case filename:extension(RelPath) of
-        ".erl" ->
-            Name = filename:basename(RelPath, ".erl"),
-            PrimaryName = filename:basename(PrimaryPath, ".erl"),
-            case Name of
-                PrimaryName -> <<"self">>;
+                    resolve_conflict_lines(Rest, Strategy, [Line | CurrentBlock], true, Acc);
                 _ ->
-                    case string:find(Name, "_test") of
-                        nomatch -> case string:find(Name, "_tests") of
-                            nomatch -> <<"import">>;
-                            _ -> <<"test">>
-                        end;
-                        _ -> <<"test">>
-                    end
-            end;
-        ".ex" ->
-            Name2 = filename:basename(RelPath, ".ex"),
-            case string:find(Name2, "_test") of
-                nomatch -> <<"import">>;
-                _ -> <<"test">>
-            end;
-        _ -> <<"related">>
+                    {Ours, _Rest1} = collect_ours_section(CurrentBlock, []),
+                    {Theirs, Rest2} = collect_theirs_section(Rest, []),
+                    ResolvedLine = resolve_conflict_block(Ours, Theirs, Strategy),
+                    resolve_conflict_lines(Rest2, Strategy, [], false, [ResolvedLine | Acc])
+            end
     end.
 
-% Find References Implementation
-find_symbol_references(FilePath, Symbol, _Line) ->
-    case file:read_file(FilePath) of
-        {ok, Content} ->
-            Pattern = "\\b" ++ Symbol ++ "\\b",
-            {ok, MP} = re:compile(Pattern),
-            
-            Lines = binary:split(Content, <<"\n">>, [global]),
-            References = lists:filtermap(fun({LineNum, LineContent}) ->
-                case re:run(LineContent, MP) of
-                    {match, Matches} ->
-                        {true, #{
-                            <<"line">> => LineNum,
-                            <<"content">> => LineContent,
-                            <<"matches">> => length(Matches)
-                        }};
-                    nomatch -> false
-                end
-            end, lists:enumerate(1, Lines)),
-            
-            #{
-                <<"success">> => true,
-                <<"file">> => list_to_binary(FilePath),
-                <<"symbol">> => list_to_binary(Symbol),
-                <<"references">> => References,
-                <<"count">> => length(References)
-            };
-        {error, Reason} ->
-            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
+collect_ours_section([], Acc) -> {lists:reverse(Acc), []};
+collect_ours_section([Line | Rest], Acc) ->
+    case binary:match(Line, <<"=======">>) of
+        nomatch -> collect_ours_section(Rest, [Line | Acc]);
+        _ -> {lists:reverse(Acc), Rest}
     end.
 
-find_function_callers(FilePath, Function) ->
-    Ext = filename:extension(FilePath),
-    Dir = filename:dirname(FilePath),
-    
-    Pattern = "\\b" ++ Function ++ "\\s*\\(",
-    {ok, MP} = re:compile(Pattern),
-    
-    Files = case Ext of
-        ".erl" -> filelib:wildcard(filename:join([Dir, "**/*.erl"]));
-        ".ex" -> filelib:wildcard(filename:join([Dir, "**/*.ex"]));
-        _ -> filelib:wildcard(filename:join([Dir, "**/*" ++ Ext]))
-    end,
-    
-    Callers = lists:filtermap(fun(File) ->
-        case file:read_file(File) of
-            {ok, Content} ->
-                case re:run(Content, MP) of
-                    {match, _} ->
-                        {true, #{
-                            <<"file">> => list_to_binary(File),
-                            <<"function">> => list_to_binary(Function)
-                        }};
-                    nomatch -> false
-                end;
-            _ -> false
-        end
-    end, Files),
-    
-    #{
-        <<"success">> => true,
-        <<"function">> => list_to_binary(Function),
-        <<"callers">> => Callers,
-        <<"count">> => length(Callers)
-    }.
-
-%% HTTP Request Implementation
-%% Public API for direct use
-
-http_request(Url) ->
-    http_request(Url, #{}).
-
-http_request(Url, Opts) when is_list(Url) ->
-    http_request(list_to_binary(Url), Opts);
-http_request(Url, Opts) when is_binary(Url), is_map(Opts) ->
-    Method = maps:get(<<"method">>, Opts, <<"GET">>),
-    Headers = maps:get(<<"headers">>, Opts, #{}),
-    Body = maps:get(<<"body">>, Opts, undefined),
-    Timeout = maps:get(<<"timeout">>, Opts, 30000),
-    FollowRedirect = maps:get(<<"follow_redirect">>, Opts, true),
-    ResponseFormat = maps:get(<<"response_format">>, Opts, <<"auto">>),
-    http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat).
-
-http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat) ->
-    % Ensure hackney is started
-    case application:ensure_all_started(hackney) of
-        {ok, _} -> ok;
-        _ -> ok
-    end,
-    
-    report_progress(<<"http_request">>, <<"starting">>, #{url => Url, method => Method}),
-    
-    % Convert method to atom
-    MethodAtom = case Method of
-        <<"GET">> -> get;
-        <<"POST">> -> post;
-        <<"PUT">> -> put;
-        <<"DELETE">> -> delete;
-        <<"PATCH">> -> patch;
-        <<"HEAD">> -> head;
-        <<"OPTIONS">> -> options;
-        _ -> get
-    end,
-    
-    % Convert headers to list
-    HeaderList = maps:fold(fun(K, V, Acc) ->
-        [{iolist_to_binary(K), iolist_to_binary(V)} | Acc]
-    end, [], Headers),
-    
-    % Build request options
-    ReqOpts = [{recv_timeout, Timeout}],
-    ReqOpts1 = case FollowRedirect of
-        true -> [{follow_redirect, true} | ReqOpts];
-        false -> ReqOpts
-    end,
-    
-    % Make request
-    Result = case MethodAtom of
-        get ->
-            hackney:request(get, Url, HeaderList, <<>>, ReqOpts1);
-        head ->
-            hackney:request(head, Url, HeaderList, <<>>, ReqOpts1);
-        _ when Body =:= undefined; Body =:= nil ->
-            hackney:request(MethodAtom, Url, HeaderList, <<>>, ReqOpts1);
-        _ ->
-            hackney:request(MethodAtom, Url, HeaderList, Body, ReqOpts1)
-    end,
-    
-    case Result of
-        {ok, StatusCode, RespHeaders, RespBody} when StatusCode >= 200, StatusCode < 300 ->
-            process_http_response(StatusCode, RespHeaders, RespBody, ResponseFormat, Url);
-        {ok, StatusCode, RespHeaders, RespBody} ->
-            process_http_response(StatusCode, RespHeaders, RespBody, ResponseFormat, Url);
-        {error, Reason} ->
-            #{
-                <<"success">> => false,
-                <<"error">> => iolist_to_binary(io_lib:format("HTTP request failed: ~p", [Reason]))
-            }
+collect_theirs_section([], Acc) -> {lists:reverse(Acc), []};
+collect_theirs_section([Line | Rest], Acc) ->
+    case binary:match(Line, <<">>>>>>>">>) of
+        nomatch -> collect_theirs_section(Rest, [Line | Acc]);
+        _ -> {lists:reverse(Acc), Rest}
     end.
 
-process_http_response(StatusCode, RespHeaders, RespBody, ResponseFormat, Url) ->
-    % Auto-detect format if needed
-    DetectedFormat = case ResponseFormat of
-        <<"auto">> -> detect_response_format(RespHeaders, RespBody);
-        Other -> Other
-    end,
-    
-    % Truncate large responses
-    SafeBody = safe_binary(RespBody, 100000),
-    
-    % Parse body based on format
-    ParsedBody = case DetectedFormat of
-        <<"json">> ->
-            case jsx:is_json(SafeBody) of
-                true -> jsx:decode(SafeBody, [return_maps]);
-                false -> SafeBody
-            end;
-        _ -> SafeBody
-    end,
-    
-    % Convert headers to map
-    HeaderMap = lists:foldl(fun({K, V}, Acc) ->
-        Acc#{iolist_to_binary(K) => iolist_to_binary(V)}
-    end, #{}, RespHeaders),
-    
-    #{
-        <<"success">> => true,
-        <<"status">> => StatusCode,
-        <<"headers">> => HeaderMap,
-        <<"body">> => ParsedBody,
-        <<"url">> => Url,
-        <<"format">> => DetectedFormat
-    }.
-
-detect_response_format(Headers, _Body) ->
-    % Check content-type header
-    ContentType = case lists:keyfind(<<"content-type">>, 1, Headers) of
-        {_, CT} -> string:lowercase(CT);
-        false -> <<"unknown">>
-    end,
-    
-    case binary:match(ContentType, <<"application/json">>) of
-        nomatch -> ok;
-        _ -> ok
-    end,
-    
-    % Determine format based on content-type
-    IsJson = binary:match(ContentType, <<"application/json">>) =/= nomatch,
-    IsText = binary:match(ContentType, <<"text/">>) =/= nomatch,
-    IsImage = binary:match(ContentType, <<"image/">>) =/= nomatch,
-    
-    case {IsJson, IsText, IsImage} of
-        {true, _, _} -> <<"json">>;
-        {_, true, _} -> <<"text">>;
-        {_, _, true} -> <<"binary">>;
-        _ -> <<"text">>
-    end.
-
-%% Parallel Execution Implementation
-execute_parallel_impl(Calls) when is_list(Calls) ->
-    Parent = self(),
-    
-    % Spawn a process for each call
-    Pids = lists:map(fun(#{<<"name">> := Name, <<"args">> := Args}) ->
-        spawn_link(fun() ->
-            Result = execute(Name, Args),
-            Parent ! {parallel_result, self(), Name, Result}
-        end)
-    end, Calls),
-    
-    % Collect results
-    Results = collect_parallel_results(Pids, #{}),
-    
-    #{
-        <<"success">> => true,
-        <<"results">> => Results,
-        <<"count">> => length(Calls)
-    };
-execute_parallel_impl(Calls) ->
-    #{<<"success">> => false, <<"error">> => <<"calls must be an array">>}.
-
-collect_parallel_results([], Results) ->
-    Results;
-collect_parallel_results(Pids, Results) ->
-    receive
-        {parallel_result, Pid, Name, Result} ->
-            NewPids = lists:delete(Pid, Pids),
-            collect_parallel_results(NewPids, Results#{Name => Result})
-    after 120000 ->
-        % Timeout - return what we have
-        #{<<"error">> => <<"timeout">>}
-    end.
-
-% Helper for undo/redo results
-format_undo_results(Results) when is_list(Results) ->
-    lists:map(fun
-        ({ok, OpId}) -> #{<<"status">> => <<"ok">>, <<"operation_id">> => OpId};
-        ({error, Path, Reason}) -> #{<<"status">> => <<"error">>, <<"path">> => list_to_binary(Path), <<"reason">> => list_to_binary(io_lib:format("~p", [Reason]))};
-        ({error, Err}) -> #{<<"status">> => <<"error">>, <<"reason">> => list_to_binary(io_lib:format("~p", [Err]))}
-    end, Results);
-format_undo_results(_) ->
-    [].
-
-% Limit grep output to prevent context explosion
-limit_grep_output(Output, MaxLines) when is_binary(Output) ->
-    Lines = binary:split(Output, <<"\n">>, [global]),
-    case length(Lines) > MaxLines of
-        true ->
-            Limited = lists:sublist(Lines, MaxLines),
-            Omitted = length(Lines) - MaxLines,
-            iolist_to_binary([Limited, <<"\n... (">>, integer_to_binary(Omitted), <<" more lines omitted)">>]);
-        false ->
-            Output
+resolve_conflict_block(Ours, _Theirs, ours) ->
+    iolist_to_binary(lists:join(<<"\n">>, Ours));
+resolve_conflict_block(_Ours, Theirs, theirs) ->
+    iolist_to_binary(lists:join(<<"\n">>, Theirs));
+resolve_conflict_block(Ours, Theirs, both) ->
+    All = Ours ++ Theirs,
+    iolist_to_binary(lists:join(<<"\n">>, All));
+resolve_conflict_block(Ours, Theirs, smart) ->
+    case {Ours, Theirs} of
+        {[], Theirs} -> iolist_to_binary(lists:join(<<"\n">>, Theirs));
+        {Ours, []} -> iolist_to_binary(lists:join(<<"\n">>, Ours));
+        {Ours, Theirs} ->
+            OursContent = iolist_to_binary(lists:join(<<"\n">>, Ours)),
+            TheirsContent = iolist_to_binary(lists:join(<<"\n">>, Theirs)),
+            HasImport = fun(C) -> binary:match(C, <<"import">>) =/= nomatch 
+                                      orelse binary:match(C, <<"-include">>) =/= nomatch end,
+            case {byte_size(TheirsContent) > byte_size(OursContent),
+                  HasImport(TheirsContent), HasImport(OursContent)} of
+                {true, _, _} -> TheirsContent;
+                {false, true, false} -> TheirsContent;
+                {false, false, true} -> OursContent;
+                _ -> OursContent
+            end
     end.

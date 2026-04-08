@@ -22,7 +22,8 @@
     completion_tokens :: integer(),  % Actual tokens from API  
     estimated_tokens :: integer(),    % Estimated when API doesn't provide counts
     tool_calls :: integer(),
-    busy :: boolean()                 % Whether session is processing a request
+    busy :: boolean(),                % Whether session is processing a request
+    ephemeral :: boolean()            % If true, skip persistence and archiving
 }).
 
 -define(MAX_ITERATIONS, 100).
@@ -122,18 +123,28 @@ sessions() ->
     end.
 
 new() ->
-    new(<<>>).
+    new(<<>>, #{}).
 
 new(Id) when is_list(Id) ->
-    new(list_to_binary(Id));
+    new(list_to_binary(Id), #{});
 new(Id) ->
+    new(Id, #{}).
+
+new(Id, Options) when is_list(Id) ->
+    new(list_to_binary(Id), Options);
+new(Id, Options) when is_map(Options) ->
     Id2 = case Id of
         <<>> -> generate_id();
         _ -> Id
     end,
+    IsEphemeral = maps:get(ephemeral, Options, false),
+    %% Pass ephemeral flag via process dictionary to init/1
+    case IsEphemeral of
+        true -> erlang:put(ephemeral_session, true);
+        false -> ok
+    end,
     case coding_agent_session_sup:start_session(Id2) of
         {ok, Pid} -> 
-            ets:insert(?SESSIONS_TABLE, {Id2, Pid}),
             {ok, {Id2, Pid}};
         {error, {already_started, Pid}} -> 
             {ok, {Id2, Pid}}
@@ -170,7 +181,7 @@ ask(Session, Message, Opts) when is_list(Session) ->
     ask(iolist_to_binary(Session), Message, Opts).
 
 history(Session) when is_pid(Session) ->
-    gen_server:call(Session, history);
+    gen_server:call(Session, history, 5000);
 history(Session) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> history(Pid);
@@ -180,7 +191,7 @@ history({_, Pid}) ->
     history(Pid).
 
 open_files(Session) when is_pid(Session) ->
-    gen_server:call(Session, open_files);
+    gen_server:call(Session, open_files, 5000);
 open_files(Session) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> open_files(Pid);
@@ -190,7 +201,7 @@ open_files({_, Pid}) ->
     open_files(Pid).
 
 close_file(Session, Path) when is_pid(Session) ->
-    gen_server:call(Session, {close_file, Path});
+    gen_server:call(Session, {close_file, Path}, 5000);
 close_file(Session, Path) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> close_file(Pid, Path);
@@ -200,7 +211,7 @@ close_file({_, Pid}, Path) ->
     close_file(Pid, Path).
 
 stats(Session) when is_pid(Session) ->
-    gen_server:call(Session, stats);
+    gen_server:call(Session, stats, 5000);
 stats(Session) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> stats(Pid);
@@ -210,7 +221,7 @@ stats({_, Pid}) ->
     stats(Pid).
 
 clear(Session) when is_pid(Session) ->
-    gen_server:call(Session, clear);
+    gen_server:call(Session, clear, 5000);
 clear(Session) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> clear(Pid);
@@ -230,7 +241,7 @@ compact({_, Pid}) ->
     compact(Pid).
 
 set_context_length(Session, Length) when is_pid(Session) ->
-    gen_server:call(Session, {set_context_length, Length});
+    gen_server:call(Session, {set_context_length, Length}, 5000);
 set_context_length(Session, Length) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> set_context_length(Pid, Length);
@@ -240,7 +251,7 @@ set_context_length({_, Pid}, Length) ->
     set_context_length(Pid, Length).
 
 get_context_length(Session) when is_pid(Session) ->
-    gen_server:call(Session, get_context_length);
+    gen_server:call(Session, get_context_length, 5000);
 get_context_length(Session) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> get_context_length(Pid);
@@ -273,7 +284,7 @@ halt({_, Pid}) ->
 
 %% @doc Check if session is busy processing a request
 is_busy(Session) when is_pid(Session) ->
-    gen_server:call(Session, is_busy);
+    gen_server:call(Session, is_busy, 5000);
 is_busy(Session) when is_binary(Session) ->
     case ets:lookup(?SESSIONS_TABLE, Session) of
         [{_, Pid}] -> is_busy(Pid);
@@ -315,6 +326,14 @@ init([Id, WorkingDir]) ->
         _ -> ?DEFAULT_CONTEXT_LENGTH
     end,
     io:format("[session] Model ~s has context length ~p~n", [Model, ContextLength]),
+    %% Read ephemeral flag from process dictionary (set by new/2)
+    IsEphemeral = erlang:get(ephemeral_session) =:= true,
+    erlang:erase(ephemeral_session),
+    %% Self-register in ETS so session is queryable immediately (skip for ephemeral)
+    case IsEphemeral of
+        true -> ok;
+        false -> ets:insert(?SESSIONS_TABLE, {Id2, self()})
+    end,
     process_flag(trap_exit, true),
     {ok, #state{
         id = Id2,
@@ -327,7 +346,8 @@ init([Id, WorkingDir]) ->
         completion_tokens = 0,
         estimated_tokens = 0,
         tool_calls = 0,
-        busy = false
+        busy = false,
+        ephemeral = IsEphemeral
     }}.
 
 handle_call({ask, Message, _Opts}, _From, State = #state{model = Model, messages = History, working_dir = WD, id = Id, open_files = OpenFiles}) ->
@@ -497,24 +517,79 @@ handle_call(is_busy, _From, State = #state{id = SessionId}) ->
 handle_call(compact, _From, State = #state{id = Id, messages = Messages, model = Model, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET}) ->
     TotalTokens = PT + CT + ET,
     io:format("[session] Compacting session ~s (~p tokens)~n", [Id, TotalTokens]),
-    ArchiveId = archive_session(State),
-    case summarize_messages(Messages, Model) of
-        {ok, SummaryText} ->
-            SummaryMsg = #{
-                <<"role">> => <<"system">>,
-                <<"content">> => <<"This is a summary of the previous conversation:\n\n", SummaryText/binary>>
-            },
+    case split_messages(Messages, ?KEEP_RECENT_MESSAGES) of
+        {[], _RecentMsgs} ->
+            %% All messages are recent — use sliding window
+            KeepCount = max(5, round(length(Messages) * 0.5)),
+            NewMessages = lists:sublist(Messages, KeepCount),
+            NewTokenEst = lists:foldl(fun(M, Acc) ->
+                Content = maps:get(<<"content">>, M, <<>>),
+                byte_size(Content) div 4 + Acc
+            end, 0, NewMessages),
+            io:format("[session] Compacted ~s via sliding window (kept ~p messages)~n", [Id, KeepCount]),
             NewState = State#state{
-                messages = [SummaryMsg],
+                messages = NewMessages,
                 prompt_tokens = 0,
                 completion_tokens = 0,
-                estimated_tokens = byte_size(SummaryText) div 4
+                estimated_tokens = NewTokenEst
             },
-            io:format("[session] Session compacted. Archived as ~s~n", [ArchiveId]),
-            {reply, {ok, #{archived_as => ArchiveId, summary_size => byte_size(SummaryText)}}, NewState};
-        {error, Reason} ->
-            io:format("[session] Compaction failed: ~p~n", [Reason]),
-            {reply, {error, Reason}, State}
+            {reply, {ok, #{method => sliding_window, kept => KeepCount}}, NewState};
+        {OldMsgs, RecentMsgs} ->
+            io:format("[session] Summarizing ~p old messages, keeping ~p recent~n", [length(OldMsgs), length(RecentMsgs)]),
+            case summarize_messages_with_timeout(OldMsgs, Model, ?SUMMARIZE_TIMEOUT) of
+                {ok, SummaryText} ->
+                    SummaryMsg = #{
+                        <<"role">> => <<"user">>,
+                        <<"content">> => <<"[Context from previous conversation]\n", SummaryText/binary>>
+                    },
+                    ArchiveId = case State#state.ephemeral of
+                        true -> <<>>;
+                        false -> archive_session(State)
+                    end,
+                    NewMessages = [SummaryMsg | RecentMsgs],
+                    NewTokenEst = lists:foldl(fun(M, Acc) ->
+                        Content = maps:get(<<"content">>, M, <<>>),
+                        byte_size(Content) div 4 + Acc
+                    end, 0, NewMessages),
+                    io:format("[session] Session compacted. Archived as ~s~n", [ArchiveId]),
+                    NewState = State#state{
+                        messages = NewMessages,
+                        prompt_tokens = 0,
+                        completion_tokens = 0,
+                        estimated_tokens = NewTokenEst
+                    },
+                    {reply, {ok, #{archived_as => ArchiveId, summary_size => byte_size(SummaryText)}}, NewState};
+                {error, timeout} ->
+                    io:format("[session] Compaction summarization timed out, using sliding window~n"),
+                    KeepCount = length(RecentMsgs) + min(5, length(OldMsgs)),
+                    NewMessages = lists:sublist(Messages, KeepCount),
+                    NewTokenEst = lists:foldl(fun(M, Acc) ->
+                        Content = maps:get(<<"content">>, M, <<>>),
+                        byte_size(Content) div 4 + Acc
+                    end, 0, NewMessages),
+                    NewState = State#state{
+                        messages = NewMessages,
+                        prompt_tokens = 0,
+                        completion_tokens = 0,
+                        estimated_tokens = NewTokenEst
+                    },
+                    {reply, {ok, #{method => sliding_window_fallback, kept => KeepCount}}, NewState};
+                {error, Reason} ->
+                    io:format("[session] Compaction failed: ~p, using sliding window~n", [Reason]),
+                    KeepCount = length(RecentMsgs) + min(5, length(OldMsgs)),
+                    NewMessages = lists:sublist(Messages, KeepCount),
+                    NewTokenEst = lists:foldl(fun(M, Acc) ->
+                        Content = maps:get(<<"content">>, M, <<>>),
+                        byte_size(Content) div 4 + Acc
+                    end, 0, NewMessages),
+                    NewState = State#state{
+                        messages = NewMessages,
+                        prompt_tokens = 0,
+                        completion_tokens = 0,
+                        estimated_tokens = NewTokenEst
+                    },
+                    {reply, {ok, #{method => sliding_window_fallback, kept => KeepCount}}, NewState}
+            end
     end;
 
 handle_call(save_session, _From, State = #state{id = Id, model = Model, context_length = ContextLength, working_dir = WD, open_files = OpenFiles, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, tool_calls = TC}) ->
@@ -1012,7 +1087,10 @@ compact_session(State = #state{id = Id, messages = Messages, model = Model,
     io:format("[session] Compacting session ~s (~p/~p tokens, ~p%)~n", 
               [Id, TotalTokens, ContextLength, round((TotalTokens / max(ContextLength, 1)) * 100)]),
     
-    ArchiveId = archive_session(State),
+    ArchiveId = case State#state.ephemeral of
+        true -> <<>>;
+        false -> archive_session(State)
+    end,
     
     Result = case split_messages(Messages, ?KEEP_RECENT_MESSAGES) of
         {[], _RecentMsgs} ->
