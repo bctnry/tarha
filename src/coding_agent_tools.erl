@@ -968,6 +968,19 @@ execute(<<"list_models">>, Args) -> coding_agent_tools_model:execute(<<"list_mod
 execute(<<"switch_model">>, Args) -> coding_agent_tools_model:execute(<<"switch_model">>, Args);
 execute(<<"show_model">>, Args) -> coding_agent_tools_model:execute(<<"show_model">>, Args);
 
+% Search -> coding_agent_tools_search (additional)
+execute(<<"find_references">>, Args) -> coding_agent_tools_search:execute(<<"find_references">>, Args);
+execute(<<"get_callers">>, Args) -> coding_agent_tools_search:execute(<<"get_callers">>, Args);
+
+% Refactor -> coding_agent_tools_refactor (additional)
+execute(<<"rename_symbol">>, Args) -> coding_agent_tools_refactor:execute(<<"rename_symbol">>, Args);
+execute(<<"extract_function">>, Args) -> coding_agent_tools_refactor:execute(<<"extract_function">>, Args);
+execute(<<"generate_docs">>, Args) -> coding_agent_tools_refactor:execute(<<"generate_docs">>, Args);
+
+% Command -> coding_agent_tools_command (additional)
+execute(<<"fetch_docs">>, Args) -> coding_agent_tools_command:execute(<<"fetch_docs">>, Args);
+execute(<<"load_context">>, Args) -> coding_agent_tools_command:execute(<<"load_context">>, Args);
+
 % Skills -> coding_agent_tools_skills
 execute(<<"list_skills">>, Args) -> coding_agent_tools_skills:execute(<<"list_skills">>, Args);
 execute(<<"load_skill">>, Args) -> coding_agent_tools_skills:execute(<<"load_skill">>, Args);

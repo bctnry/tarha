@@ -121,9 +121,135 @@ execute(<<"generate_tests">>, #{<<"file">> := FilePath} = Args) ->
             };
         {error, Reason} ->
             #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
+    end;
+
+
+% Symbol refactoring tools
+execute(<<"extract_function">>, #{<<"file">> := FilePath, <<"start_line">> := StartLine, <<"end_line">> := EndLine, <<"new_function_name">> := FuncName}) ->
+    PathStr = coding_agent_tools:sanitize_path(FilePath),
+    coding_agent_tools:report_progress(<<"extract_function">>, <<"starting">>, #{file => FilePath, function => FuncName}),
+    case file:read_file(PathStr) of
+        {ok, Content} ->
+            Lines = binary:split(Content, <<"\n">>, [global]),
+            LineCount = length(Lines),
+            if
+                StartLine < 1 orelse EndLine < StartLine orelse EndLine > LineCount ->
+                    #{<<"success">> => false, <<"error">> => <<"Invalid line range">>};
+                true ->
+                    Extracted = lists:sublist(Lines, StartLine, EndLine - StartLine + 1),
+                    ExtractedBin = iolist_to_binary(lists:join(<<"\n">>, Extracted)),
+                    IndentedExtracted = indent_lines(ExtractedBin),
+                    NewFunc = iolist_to_binary([FuncName, <<"() ->\n">>, IndentedExtracted, <<".\n">>]),
+                    CallLine = iolist_to_binary([FuncName, <<"()">>]),
+                    Before = lists:sublist(Lines, StartLine - 1),
+                    After = lists:nthtail(EndLine, Lines),
+                    NewContent = iolist_to_binary(lists:join(<<"\n">>, Before ++ [CallLine | After])),
+                    case file:write_file(PathStr, NewContent) of
+                        ok ->
+                            coding_agent_tools:report_progress(<<"extract_function">>, <<"complete">>, #{}),
+                            #{<<"success">> => true, <<"file">> => FilePath,
+                              <<"new_function">> => FuncName,
+                              <<"lines_extracted">> => EndLine - StartLine + 1,
+                              <<"new_function_code">> => NewFunc};
+                        {error, Reason} ->
+                            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
+                    end
+            end;
+        {error, Reason} ->
+            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
+    end;
+
+execute(<<"rename_symbol">>, #{<<"file">> := FilePath, <<"old_name">> := OldName, <<"new_name">> := NewName} = Args) ->
+    Scope = maps:get(<<"scope">>, Args, <<"file">>),
+    coding_agent_tools:report_progress(<<"rename_symbol">>, <<"starting">>, #{old => OldName, new => NewName, scope => Scope}),
+    case Scope of
+        <<"file">> ->
+            case coding_agent_tools:execute(<<"edit_file">>, #{
+                <<"path">> => FilePath,
+                <<"old_string">> => OldName,
+                <<"new_string">> => NewName,
+                <<"replace_all">> => true
+            }) of
+                #{<<"success">> := true} = Result ->
+                    coding_agent_tools:report_progress(<<"rename_symbol">>, <<"complete">>, #{}),
+                    Result#{<<"scope">> => <<"file">>, <<"files_modified">> => 1, <<"total_replacements">> => 1};
+                Error -> Error
+            end;
+        <<"project">> ->
+            GrepResult = coding_agent_tools:execute(<<"grep_files">>, #{
+                <<"pattern">> => binary_to_list(OldName),
+                <<"path">> => <<".">>
+            }),
+            Output = maps:get(<<"output">>, GrepResult, <<>>),
+            Files = extract_unique_files(Output),
+            Results = lists:map(fun(F) ->
+                coding_agent_tools:execute(<<"edit_file">>, #{
+                    <<"path">> => list_to_binary(F),
+                    <<"old_string">> => OldName,
+                    <<"new_string">> => NewName,
+                    <<"replace_all">> => true
+                })
+            end, Files),
+            SuccessCount = length([R || R <- Results, maps:get(<<"success">>, R, false) =:= true]),
+            coding_agent_tools:report_progress(<<"rename_symbol">>, <<"complete">>, #{files => SuccessCount}),
+            #{<<"success">> => true, <<"scope">> => <<"project">>,
+              <<"files_modified">> => SuccessCount, <<"total_replacements">> => SuccessCount}
+    end;
+
+execute(<<"generate_docs">>, #{<<"file">> := FilePath} = Args) ->
+    Format = maps:get(<<"format">>, Args, <<"edoc">>),
+    PathStr = coding_agent_tools:sanitize_path(FilePath),
+    coding_agent_tools:report_progress(<<"generate_docs">>, <<"starting">>, #{file => FilePath, format => Format}),
+    case file:read_file(PathStr) of
+        {ok, Content} ->
+            Exports = extract_exports(Content),
+            Docs = generate_doc_content(Exports, Format),
+            coding_agent_tools:report_progress(<<"generate_docs">>, <<"complete">>, #{}),
+            #{<<"success">> => true, <<"file">> => FilePath,
+              <<"docs">> => Docs, <<"functions_documented">> => length(Exports)};
+        {error, Reason} ->
+            #{<<"success">> => false, <<"error">> => list_to_binary(file:format_error(Reason))}
     end.
 
 %% Internal helpers
+
+indent_lines(Bin) ->
+    Lines = binary:split(Bin, <<"\n">>, [global]),
+    Indented = [<<"    ", Line/binary>> || Line <- Lines, Line =/= <<>>],
+    iolist_to_binary(lists:join(<<"\n">>, Indented)).
+
+extract_unique_files(GrepOutput) ->
+    Lines = binary:split(GrepOutput, <<"\n">>, [global, trim_all]),
+    Files = lists:filtermap(fun(Line) ->
+        case binary:split(Line, <<":">>, []) of
+            [File | _] -> {true, binary_to_list(File)};
+            _ -> false
+        end
+    end, Lines),
+    lists:usort(Files).
+
+extract_exports(Content) ->
+    case re:run(Content, "-export\(\[([^\]]+)\]\)", [global, {capture, [1], binary}]) of
+        {match, Captures} ->
+            AllExports = iolist_to_binary([C || [C] <- Captures, C =/= <<>>]),
+            case re:run(AllExports, "([a-z][a-zA-Z0-9_@]*)/(\d+)", [global, {capture, [1, 2], binary}]) of
+                {match, FuncCaptures} ->
+                    [{Name, list_to_integer(binary_to_list(Arity))} || [Name, Arity] <- FuncCaptures];
+                _ -> []
+            end;
+        _ -> []
+    end.
+
+generate_doc_content(Exports, <<"edoc">>) ->
+    lists:map(fun({Name, Arity}) ->
+        iolist_to_binary(io_lib:format("%% @doc TODO: Describe ~s/~p\n%% @spec ~s() -> term()\n", [Name, Arity, Name]))
+    end, Exports);
+generate_doc_content(Exports, <<"markdown">>) ->
+    lists:map(fun({Name, Arity}) ->
+        iolist_to_binary(io_lib:format("### ~s/~p\nTODO: Describe this function.\n\n", [Name, Arity]))
+    end, Exports);
+generate_doc_content(Exports, _) ->
+    generate_doc_content(Exports, <<"edoc">>).
 
 generate_commit_message(Diff) ->
     Lines = string:split(Diff, "\n", all),

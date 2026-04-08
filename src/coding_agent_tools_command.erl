@@ -20,7 +20,38 @@ execute(<<"http_request">>, Args) ->
     http_request_impl(Args);
 
 execute(<<"execute_parallel">>, #{<<"calls">> := Calls}) ->
-    execute_parallel_impl(Calls).
+    execute_parallel_impl(Calls);
+
+execute(<<"fetch_docs">>, Args) ->
+    Url = maps:get(<<"url">>, Args),
+    Format = maps:get(<<"format">>, Args, <<"text">>),
+    coding_agent_tools:report_progress(<<"fetch_docs">>, <<"starting">>, #{url => Url}),
+    case http_request_impl(Args#{<<"response_format">> => Format}) of
+        #{<<"success">> := false} = Error ->
+            Error;
+        #{<<"body">> := Body} = Result ->
+            TextBody = case Format of
+                <<"html">> -> strip_html(Body);
+                _ -> Body
+            end,
+            MaxSize = 20000,
+            Trimmed = case byte_size(TextBody) of
+                Size when Size > MaxSize ->
+                    <<TrimmedBytes:MaxSize/binary, _/binary>> = TextBody,
+                    <<TrimmedBytes/binary, "... (truncated)">>;
+                _ -> TextBody
+            end,
+            coding_agent_tools:report_progress(<<"fetch_docs">>, <<"complete">>, #{}),
+            Result#{<<"content">> => Trimmed, <<"format">> => Format}
+    end;
+
+execute(<<"load_context">>, #{<<"paths">> := Paths} = Args) ->
+    MaxSize = maps:get(<<"max_total_size">>, Args, 50000),
+    coding_agent_tools:report_progress(<<"load_context">>, <<"starting">>, #{}),
+    {Content, FileInfos, TotalSize} = load_files(Paths, MaxSize, <<>>, [], 0),
+    coding_agent_tools:report_progress(<<"load_context">>, <<"complete">>, #{}),
+    #{<<"success">> => true, <<"content">> => Content,
+      <<"files">> => FileInfos, <<"total_size">> => TotalSize}.
 
 %% HTTP Request API
 
@@ -39,6 +70,29 @@ http_request(Url, Opts) when is_binary(Url), is_map(Opts) ->
     http_request_impl(Url, Method, Headers, Body, Timeout, FollowRedirect, ResponseFormat).
 
 %% Internal helpers
+
+strip_html(Bin) when is_binary(Bin) ->
+    % Basic HTML tag stripping
+    re:replace(Bin, "<[^>]+>", "", [global, {return, binary}]);
+strip_html(Text) ->
+    iolist_to_binary(Text).
+
+load_files([], _MaxSize, Acc, Infos, TotalSize) ->
+    {Acc, lists:reverse(Infos), TotalSize};
+load_files([Path | Rest], MaxSize, Acc, Infos, TotalSize) when TotalSize < MaxSize ->
+    PathStr = binary_to_list(Path),
+    case file:read_file(PathStr) of
+        {ok, Content} ->
+            Header = iolist_to_binary([<<"\n--- ">>, Path, <<" ---\n">>]),
+            NewAcc = iolist_to_binary([Acc, Header, Content]),
+            NewSize = TotalSize + byte_size(Content),
+            Info = #{<<"path">> => Path, <<"size">> => byte_size(Content)},
+            load_files(Rest, MaxSize, NewAcc, [Info | Infos], NewSize);
+        {error, _} ->
+            load_files(Rest, MaxSize, Acc, Infos, TotalSize)
+    end;
+load_files(_, _MaxSize, Acc, Infos, TotalSize) ->
+    {Acc, lists:reverse(Infos), TotalSize}.
 
 http_request_impl(Args) when is_map(Args) ->
     Url = maps:get(<<"url">>, Args),
