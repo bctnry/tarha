@@ -16,7 +16,9 @@
     load_yaml/1,
     get_fallback_chain/0,
     get_retryable_errors/0,
-    get_fallback_enabled/0
+    get_fallback_enabled/0,
+    get_mcp_servers/0,
+    get_mcp_servers/1
 ]).
 
 %% @doc Centralized configuration for the coding agent.
@@ -321,3 +323,58 @@ set_model(Model) when is_list(Model) ->
 -spec set_ollama_host(string()) -> ok.
 set_ollama_host(Host) when is_list(Host) ->
     application:set_env(coding_agent, ollama_host, Host).
+
+get_mcp_servers() ->
+    Workspace = workspace(),
+    get_mcp_servers(Workspace).
+
+get_mcp_servers(Workspace) ->
+    ConfigFile = filename:join(Workspace, ".tarha/mcp_servers.json"),
+    case filelib:is_file(ConfigFile) of
+        true ->
+            case file:read_file(ConfigFile) of
+                {ok, Content} ->
+                    case jsx:is_json(Content) of
+                        true ->
+                            Decoded = jsx:decode(Content, [return_maps]),
+                            Servers = maps:get(<<"mcpServers">>, Decoded, #{}),
+                            maps:map(fun(_Name, Config) ->
+                                normalize_mcp_config(Config)
+                            end, Servers);
+                        false ->
+                            io:format("[config] Invalid JSON in ~s~n", [ConfigFile]),
+                            #{}
+                    end;
+                {error, Reason} ->
+                    io:format("[config] Error reading ~s: ~p~n", [ConfigFile, Reason]),
+                    #{}
+            end;
+        false ->
+            application:get_env(coding_agent, mcp_servers, #{})
+    end.
+
+normalize_mcp_config(Config) when is_map(Config) ->
+    Command = maps:get(<<"command">>, Config, undefined),
+    Args = maps:get(<<"args">>, Config, []),
+    Env = maps:get(<<"env">>, Config, #{}),
+    Url = maps:get(<<"url">>, Config, undefined),
+    Transport = case {Command, Url} of
+        {undefined, undefined} -> undefined;
+        {_, undefined} -> stdio;
+        {undefined, _} -> http
+    end,
+    Disabled = maps:get(<<"disabled">>, Config, false),
+    Headers = maps:get(<<"headers">>, Config, []),
+    Timeout = maps:get(<<"timeout">>, Config, 30000),
+    #{
+        command => if is_binary(Command) -> binary_to_list(Command); is_list(Command) -> Command; true -> undefined end,
+        args => [if is_binary(A) -> binary_to_list(A); is_list(A) -> A end || A <- Args],
+        env => maps:to_list(Env),
+        url => if is_binary(Url) -> binary_to_list(Url); is_list(Url) -> Url; true -> undefined end,
+        transport => Transport,
+        disabled => Disabled,
+        headers => Headers,
+        timeout => Timeout
+    };
+normalize_mcp_config(_) ->
+    #{}.

@@ -937,7 +937,23 @@ tools() ->
                 }
             }
         }
-    ].
+    ] ++ mcp_tool_schemas().
+
+mcp_tool_schemas() ->
+    try
+        case whereis(coding_agent_mcp_registry) of
+            undefined -> [];
+            _ ->
+                {ok, MCPTools} = coding_agent_mcp_registry:get_all_tools(),
+                lists:map(fun({Prefix, Tool}) ->
+                    BaseName = maps:get(<<"name">>, Tool, <<"">>),
+                    FullName = <<Prefix/binary, BaseName/binary>>,
+                    Tool#{<<"name">> => FullName}
+                end, MCPTools)
+        end
+    catch
+        _:_ -> []
+    end.
 
 % Execute multiple tools concurrently (for parallel operations)
 
@@ -1089,6 +1105,31 @@ execute(<<"load_skill">>, Args) -> coding_agent_tools_skills:execute(<<"load_ski
 execute(<<"hello">>, _Args) ->
     io:format("hello world~n"),
     #{<<"success">> => true, <<"message">> => <<"hello world">>};
+
+% MCP tool dispatch
+execute(ToolName, Args) when is_binary(ToolName) ->
+    case binary:match(ToolName, <<"mcp_">>) of
+        {0, _} ->
+            case catch coding_agent_mcp_registry:execute(ToolName, Args) of
+                {ok, Result} when is_binary(Result) ->
+                    #{<<"success">> => true, <<"output">> => Result};
+                {error, Error} ->
+                    ErrorMsg = if is_binary(Error) -> Error; true -> iolist_to_binary(io_lib:format("~p", [Error])) end,
+                    #{<<"success">> => false, <<"error">> => ErrorMsg};
+                {'EXIT', _} ->
+                    #{<<"success">> => false, <<"error">> => <<"MCP system not available">>}
+            end;
+        _ ->
+            case catch coding_agent_plugins:execute(ToolName, Args) of
+                #{<<"success">> := _} = PluginResult -> PluginResult;
+                {error, not_found} ->
+                    #{<<"success">> => false, <<"error">> => <<"Unknown tool">>};
+                {error, Reason} ->
+                    #{<<"success">> => false, <<"error">> => iolist_to_binary(io_lib:format("~p", [Reason]))};
+                {'EXIT', _} ->
+                    #{<<"success">> => false, <<"error">> => <<"Unknown tool">>}
+            end
+    end;
 
 % Catch-all
 execute(_Tool, _Args) ->

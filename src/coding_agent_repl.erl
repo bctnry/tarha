@@ -1,6 +1,7 @@
 -module(coding_agent_repl).
 -export([start/0, start/1, loop/3]).
 -export([rl/0]).
+-export([load_mcp_servers/0]).
 
 %% Mode: build | plan | meticulous
 %% In build mode, agent acts normally
@@ -21,6 +22,9 @@ start() ->
 start(_Args) ->
     try
         application:ensure_all_started(coding_agent),
+        
+        % Auto-load MCP servers from config
+        spawn(fun() -> timer:sleep(500), (catch coding_agent_repl:load_mcp_servers()) end),
         
         % Initialize mode to build
         put(?MODE_KEY, build),
@@ -54,6 +58,9 @@ start(_Args) ->
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/showplan") ++ A:dim("      - Show current plan") ++ A:bright_cyan("                      ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/editplan") ++ A:dim("      - Edit plan in editor") ++ A:bright_cyan("                    ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/quit, /exit") ++ A:dim("   - Exit the REPL") ++ A:bright_cyan("                          ║")]),
+        io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/mcp") ++ A:dim("            - List MCP servers") ++ A:bright_cyan("                         ║")]),
+        io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/mcp-add <n>") ++ A:dim("  - Add MCP server") ++ A:bright_cyan("                             ║")]),
+        io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/mcp-tools") ++ A:dim("      - List MCP tools") ++ A:bright_cyan("                            ║")]),
         io:format("~ts~n", [A:bright_cyan("╚════════════════════════════════════════════════════════════╝")]),
         io:format("~n"),
         
@@ -329,6 +336,10 @@ process_command(SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(R
     io:format("  " ++ coding_agent_ansi:bright_white("/steps") ++ coding_agent_ansi:dim("          - View implementation steps") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/confirm") ++ coding_agent_ansi:dim("        - Confirm plan for execution") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/exec") ++ coding_agent_ansi:dim("           - Execute next step") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/mcp") ++ coding_agent_ansi:dim("            - List MCP servers and status") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/mcp-add <cfg>") ++ coding_agent_ansi:dim("    - Add MCP server from config") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/mcp-remove <n>") ++ coding_agent_ansi:dim(" - Remove MCP server") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/mcp-tools") ++ coding_agent_ansi:dim("        - List MCP tools") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/quit, /exit") ++ coding_agent_ansi:dim("    - Exit REPL") ++ "~n"),
     io:format("~n" ++ coding_agent_ansi:bright_yellow("Current mode:") ++ " ~s~n", [get_mode_indicator(Mode)]),
     {continue, History, Mode};
@@ -1069,6 +1080,136 @@ process_command(SessionId, History, "skip " ++ NumStr, Mode) ->
     end,
     {continue, History, Mode};
 
+process_command(_SessionId, History, "mcp" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    case whereis(coding_agent_mcp_registry) of
+        undefined ->
+            io:format("~n~ts MCP system not started.~n~n", [coding_agent_ansi:bright_red("✗")]);
+        _ ->
+            Servers = coding_agent_mcp_registry:list_servers(),
+            io:format("~n~ts~n", [coding_agent_ansi:bright_cyan("═══ MCP Servers ═══")]),
+            case Servers of
+                [] ->
+                    io:format("  No MCP servers configured.~n"),
+                    io:format("  Add servers to ~ts~n", [coding_agent_ansi:bright_white(".tarha/mcp_servers.json")]),
+                    io:format("  Or use ~ts to add one.~n", [coding_agent_ansi:bright_white("/mcp-add <name>")]);
+                _ ->
+                    lists:foreach(fun({Name, Info, Status}) ->
+                        StatusStr = case Status of
+                            ready -> coding_agent_ansi:bright_green("ready");
+                            initializing -> coding_agent_ansi:bright_yellow("init");
+                            error -> coding_agent_ansi:bright_red("error");
+                            _ -> coding_agent_ansi:dim(atom_to_list(Status))
+                        end,
+                        ToolCount = length(maps:get(tools, Info, [])),
+                        ResCount = length(maps:get(resources, Info, [])),
+                        Transport = maps:get(transport, Info, <<"">>),
+                        io:format("  ~ts  ~ts  ~p tools, ~p resources  [~s]~n",
+                                  [coding_agent_ansi:bright_white(binary_to_list(Name)), StatusStr,
+                                   ToolCount, ResCount, Transport])
+                    end, Servers)
+            end,
+            io:format("~ts~n~n", [coding_agent_ansi:bright_cyan("════════════════════")])
+    end,
+    {continue, History, Mode};
+
+process_command(_SessionId, History, "mcp-add " ++ NameStr, Mode) ->
+    case whereis(coding_agent_mcp_registry) of
+        undefined ->
+            io:format("~n~ts MCP system not started.~n~n", [coding_agent_ansi:bright_red("✗")]),
+            {continue, History, Mode};
+        _ ->
+            Name = list_to_binary(string:trim(NameStr)),
+            Servers = coding_agent_config:get_mcp_servers(),
+            case maps:get(Name, Servers, undefined) of
+                undefined ->
+                    io:format("~n~ts Server '~s' not found in config.~n", [coding_agent_ansi:bright_red("✗"), NameStr]),
+                    io:format("  Add it to .tarha/mcp_servers.json first.~n~n");
+                Config ->
+                    case maps:get(disabled, Config, false) of
+                        true ->
+                            io:format("~n~ts Server '~s' is disabled in config.~n~n", [coding_agent_ansi:bright_yellow("!"), NameStr]);
+                        false ->
+                            FullConfig = Config#{name => Name},
+                            io:format("~nStarting MCP server ~s...~n", [NameStr]),
+                            case coding_agent_mcp_registry:start_server(FullConfig) of
+                                {ok, _} ->
+                                    io:format("~ts Server ~s started.~n~n", [coding_agent_ansi:bright_green("✓"), NameStr]);
+                                {error, Reason} ->
+                                    io:format("~ts Failed: ~p~n~n", [coding_agent_ansi:bright_red("✗"), Reason])
+                            end
+                    end
+            end,
+            {continue, History, Mode}
+    end;
+
+process_command(_SessionId, History, "mcp-remove " ++ NameStr, Mode) ->
+    Name = list_to_binary(string:trim(NameStr)),
+    case coding_agent_mcp_registry:stop_server(Name) of
+        ok ->
+            io:format("~n~ts Server ~s removed.~n~n", [coding_agent_ansi:bright_green("✓"), NameStr]);
+        {error, not_found} ->
+            io:format("~n~ts Server ~s not found.~n~n", [coding_agent_ansi:bright_red("✗"), NameStr])
+    end,
+    {continue, History, Mode};
+
+process_command(_SessionId, History, "mcp-tools" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    case whereis(coding_agent_mcp_registry) of
+        undefined ->
+            io:format("~n~ts MCP system not started.~n~n", [coding_agent_ansi:bright_red("✗")]);
+        _ ->
+            MCPTools = coding_agent_mcp_registry:get_all_tools(),
+            case MCPTools of
+                [] ->
+                    io:format("~n  No MCP tools available.~n~n");
+                _ ->
+                    io:format("~n~ts~n", [coding_agent_ansi:bright_cyan("═══ MCP Tools ═══")]),
+                    lists:foreach(fun({Prefix, Tool}) ->
+                        BaseName = maps:get(<<"name">>, Tool, <<"">>),
+                        Desc = maps:get(<<"description">>, Tool, <<"">>),
+                        FullName = <<Prefix/binary, BaseName/binary>>,
+                        DescPreview = case byte_size(Desc) > 80 of
+                            true -> <<(binary:part(Desc, 0, 80))/binary, "...">>;
+                            false -> Desc
+                        end,
+                        io:format("  ~ts  ~ts~n", [coding_agent_ansi:bright_white(binary_to_list(FullName)), coding_agent_ansi:dim(binary_to_list(DescPreview))])
+                    end, MCPTools),
+                    io:format("~ts~n~n", [coding_agent_ansi:bright_cyan("════════════════════")])
+            end
+    end,
+    {continue, History, Mode};
+
+process_command(_SessionId, History, "mcp-resources" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    case whereis(coding_agent_mcp_registry) of
+        undefined ->
+            io:format("~n~ts MCP system not started.~n~n", [coding_agent_ansi:bright_red("✗")]);
+        _ ->
+            Servers = coding_agent_mcp_registry:list_servers(),
+            AllResources = lists:flatmap(fun({Name, Info, Status}) ->
+                case Status of
+                    ready ->
+                        Resources = maps:get(resources, Info, []),
+                        [{Name, R} || R <- Resources];
+                    _ -> []
+                end
+            end, Servers),
+            case AllResources of
+                [] ->
+                    io:format("~n  No MCP resources available.~n~n");
+                _ ->
+                    io:format("~n~ts~n", [coding_agent_ansi:bright_cyan("═══ MCP Resources ═══")]),
+                    lists:foreach(fun({ServerName, R}) ->
+                        Uri = maps:get(<<"uri">>, R, <<"">>),
+                        Desc = maps:get(<<"description">>, R, <<"">>),
+                        io:format("  ~ts:~ts  ~ts~n",
+                                  [coding_agent_ansi:bright_white(binary_to_list(ServerName)),
+                                   coding_agent_ansi:dim(binary_to_list(Uri)),
+                                   coding_agent_ansi:dim(binary_to_list(Desc))])
+                    end, AllResources),
+                    io:format("~ts~n~n", [coding_agent_ansi:bright_cyan("════════════════════════")])
+            end
+    end,
+    {continue, History, Mode};
+
 
 process_command(SessionId, History, Unknown, Mode) ->
     io:format("~ts /~s~n~ts~n~n", [coding_agent_ansi:bright_red("Unknown command:"), Unknown, coding_agent_ansi:dim("Type /help for available commands.")]),
@@ -1779,3 +1920,24 @@ load_history() ->
 save_history(History) ->
     Data = lists:join(<<"\n">>, lists:sublist(History, 100)),
     file:write_file(?HISTORY_FILE, Data).
+
+load_mcp_servers() ->
+    case whereis(coding_agent_mcp_registry) of
+        undefined -> ok;
+        _ ->
+            Servers = coding_agent_config:get_mcp_servers(),
+            maps:foreach(fun(Name, Config) ->
+                case maps:get(disabled, Config, false) of
+                    true -> ok;
+                    false ->
+                        FullConfig = Config#{name => Name},
+                        case coding_agent_mcp_registry:start_server(FullConfig) of
+                            {ok, _} ->
+                                io:format("[mcp] Started server ~s~n", [binary_to_list(Name)]);
+                            {error, already_running} -> ok;
+                            {error, Reason} ->
+                                io:format("[mcp] Failed to start ~s: ~p~n", [binary_to_list(Name), Reason])
+                        end
+                end
+            end, Servers)
+    end.
