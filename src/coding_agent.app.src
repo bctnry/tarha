@@ -16,6 +16,8 @@
   {modules,
    [coding_agent_app,
     coding_agent_sup,
+    coding_agent_lifeline,
+    coding_agent_lifeline_sup,
     coding_agent_config,
     coding_agent_ollama,
     coding_agent_tools,
