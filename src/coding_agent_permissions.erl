@@ -38,6 +38,11 @@ handle_call({check, ToolName, Args}, _From, State = #state{mode = Mode}) ->
                 true -> {allow, plan_readonly};
                 false -> {deny, plan_mode}
             end;
+        meticulous ->
+            case is_readonly_tool(ToolName) of
+                true -> {allow, meticulous_readonly};
+                false -> {deny, meticulous_mode}
+            end;
         bypassPermissions -> {allow, bypass};
         ask ->
             case check_rules(ToolName, Args, State) of

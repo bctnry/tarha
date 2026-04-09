@@ -2,15 +2,19 @@
 -export([start/0, start/1, loop/3]).
 -export([rl/0]).
 
-%% Mode: build | plan
+%% Mode: build | plan | meticulous
 %% In build mode, agent acts normally
 %% In plan mode, agent discusses and refines plans
+%% In meticulous mode, agent breaks plans into steps and executes one by one
 
 -define(HISTORY_FILE, ".tarha/history").
 
 %% Plan mode state stored in process dictionary
 -define(MODE_KEY, {coding_agent_repl, mode}).
 -define(PLAN_KEY, {coding_agent_repl, current_plan}).
+-define(STEPS_KEY, {coding_agent_repl, meticulous_steps}).
+-define(STEP_INDEX_KEY, {coding_agent_repl, current_step}).
+-define(PLAN_DIR, ".tarha/plans").
 
 start() ->
     start([]).
@@ -21,6 +25,8 @@ start(_Args) ->
         % Initialize mode to build
         put(?MODE_KEY, build),
         put(?PLAN_KEY, <<"">>),
+        put(?STEPS_KEY, []),
+        put(?STEP_INDEX_KEY, 0),
         
         io:format("~n"),
         A = coding_agent_ansi,
@@ -99,15 +105,95 @@ get_current_plan() ->
 set_current_plan(Plan) ->
     put(?PLAN_KEY, Plan).
 
+get_meticulous_steps() ->
+    case get(?STEPS_KEY) of
+        undefined -> [];
+        Steps -> Steps
+    end.
+
+set_meticulous_steps(Steps) ->
+    put(?STEPS_KEY, Steps).
+
+get_current_step_index() ->
+    case get(?STEP_INDEX_KEY) of
+        undefined -> 0;
+        Idx -> Idx
+    end.
+
+set_current_step_index(Idx) ->
+    put(?STEP_INDEX_KEY, Idx).
+
+save_steps_to_files() ->
+    Steps = get_meticulous_steps(),
+    PlanDir = ?PLAN_DIR,
+    filelib:ensure_dir(PlanDir ++ "/"),
+    lists:foreach(fun({Idx, Step}) ->
+        Title = maps:get(title, Step, <<"untitled">>),
+        SafeName = make_safe_filename(Title),
+        Filename = iolist_to_binary([
+            PlanDir, "/", integer_to_binary(Idx + 1), "_", SafeName, ".md"
+        ]),
+        Content = iolist_to_binary([
+            <<"# Step ">>, integer_to_binary(Idx + 1), <<": ">>, Title, <<"\n\n">>,
+            <<"## Description\n">>, maps:get(description, Step, <<"">>), <<"\n\n">>,
+            <<"## Files\n">>, maps:get(files, Step, <<"">>), <<"\n\n">>,
+            <<"## Status\n">>, case Idx < get_current_step_index() of
+                true -> <<"completed">>;
+                false -> case Idx =:= get_current_step_index() of
+                    true -> <<"in_progress">>;
+                    false -> <<"pending">>
+                end
+            end, <<"\n">>
+        ]),
+        file:write_file(Filename, Content)
+    end, lists:zip(lists:seq(0, length(Steps) - 1), Steps)).
+
+make_safe_filename(Title) ->
+    re:replace(Title, <<"[^a-zA-Z0-9_-]">>, <<"_">>, [global, {return, binary}]).
+
+parse_steps_from_response(Response) when is_binary(Response) ->
+    StepStart = <<"<<<STEP">>,
+    StepEnd = <<"<<<ENDSTEP">>,
+    case binary:match(Response, StepStart) of
+        nomatch -> [];
+        _ ->
+            Parts = binary:split(Response, StepStart, [global]),
+            Steps = lists:filtermap(fun(Part) ->
+                case binary:match(Part, StepEnd) of
+                    nomatch -> false;
+                    _ ->
+                        [Body | _] = binary:split(Part, StepEnd),
+                        Title = case re:run(Body, <<"Title:\\s*(.+?)\\n">>, [{capture, [1], binary}]) of
+                            {match, [T]} -> T;
+                            _ -> <<"untitled">>
+                        end,
+                        Desc = case re:run(Body, <<"Description:\\s*(.+?)(?:\\nFiles:|$)">>, [{capture, [1], binary}, dotall]) of
+                            {match, [D]} -> D;
+                            _ -> Body
+                        end,
+                        Files = case re:run(Body, <<"Files:\\s*(.+?)(?:\\n|$)">>, [{capture, [1], binary}]) of
+                            {match, [F]} -> F;
+                            _ -> <<"">>
+                        end,
+                        {true, #{title => string:trim(Title), description => string:trim(Desc), files => string:trim(Files)}}
+                end
+            end, Parts),
+            Steps
+    end.
+
 get_mode_prompt(build) ->
     coding_agent_ansi:bright_cyan("coder") ++ "> ";
 get_mode_prompt(plan) ->
-    coding_agent_ansi:bright_magenta("plan") ++ "> ".
+    coding_agent_ansi:bright_magenta("plan") ++ "> ";
+get_mode_prompt(meticulous) ->
+    coding_agent_ansi:bright_yellow("meticulous") ++ "> ".
 
 get_mode_indicator(build) ->
     coding_agent_ansi:bright_cyan("[BUILD]");
 get_mode_indicator(plan) ->
-    coding_agent_ansi:bright_magenta("[PLAN]").
+    coding_agent_ansi:bright_magenta("[PLAN]");
+get_mode_indicator(meticulous) ->
+    coding_agent_ansi:bright_yellow("[METICULOUS]").
 
 loop(SessionId, History, Mode) ->
     Prompt = get_mode_prompt(Mode),
@@ -239,6 +325,10 @@ process_command(SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(R
     io:format("  " ++ coding_agent_ansi:bright_white("/showplan") ++ coding_agent_ansi:dim("       - Show current plan") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/editplan") ++ coding_agent_ansi:dim("       - Edit plan in external editor") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/clearplan") ++ coding_agent_ansi:dim("      - Clear current plan") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/meticulous") ++ coding_agent_ansi:dim("   - Step-by-step planning mode") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/steps") ++ coding_agent_ansi:dim("          - View implementation steps") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/confirm") ++ coding_agent_ansi:dim("        - Confirm plan for execution") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/exec") ++ coding_agent_ansi:dim("           - Execute next step") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/quit, /exit") ++ coding_agent_ansi:dim("    - Exit REPL") ++ "~n"),
     io:format("~n" ++ coding_agent_ansi:bright_yellow("Current mode:") ++ " ~s~n", [get_mode_indicator(Mode)]),
     {continue, History, Mode};
@@ -784,6 +874,7 @@ process_command(SessionId, History, "plan" ++ Rest, _Mode) when Rest =:= []; hd(
     io:format("║   /showplan    - Show current plan                          ║~n"),
     io:format("║   /editplan    - Edit plan in external editor               ║~n"),
     io:format("║   /clearplan   - Clear current plan                         ║~n"),
+    io:format("║   /meticulous   - Enter meticulous step-by-step mode        ║~n"),
     io:format("╚════════════════════════════════════════════════════════════╝~n~n"),
     set_current_mode(plan),
     {continue, History, plan};
@@ -859,7 +950,123 @@ process_command(SessionId, History, "editplan" ++ Rest, Mode) when Rest =:= []; 
 
 process_command(SessionId, History, "clearplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     set_current_plan(<<"">>),
-    io:format("~n✓ Plan cleared.~n~n"),
+    set_meticulous_steps([]),
+    set_current_step_index(0),
+    io:format("~n✓ Plan and steps cleared.~n~n"),
+    {continue, History, Mode};
+
+process_command(SessionId, History, "meticulous" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    io:format("~n╔════════════════════════════════════════════════════════════╗~n"),
+    io:format("║                 ENTERING METICULOUS MODE                    ║~n"),
+    io:format("╠════════════════════════════════════════════════════════════╣~n"),
+    io:format("║ In meticulous mode, the agent will:                       ║~n"),
+    io:format("║   1. Discuss and refine the plan with you                  ║~n"),
+    io:format("║   2. Break the plan into numbered steps                    ║~n"),
+    io:format("║   3. Save each step as a separate plan file                 ║~n"),
+    io:format("║   4. Execute steps one at a time with your approval         ║~n"),
+    io:format("║                                                             ║~n"),
+    io:format("║ Commands:                                                   ║~n"),
+    io:format("║   /steps       - View all steps and current progress        ║~n"),
+    io:format("║   /confirm      - Confirm plan, ready to execute            ║~n"),
+    io:format("║   /exec         - Execute the next pending step              ║~n"),
+    io:format("║   /skip <n>     - Skip step n                              ║~n"),
+    io:format("║   /build        - Switch to build mode (unrestricted)       ║~n"),
+    io:format("║   /plan         - Switch back to plan mode                  ║~n"),
+    io:format("╚════════════════════════════════════════════════════════════╝~n~n"),
+    set_current_mode(meticulous),
+    {continue, History, meticulous};
+
+process_command(SessionId, History, "steps" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    Steps = get_meticulous_steps(),
+    CurrentIdx = get_current_step_index(),
+    case Steps of
+        [] ->
+            io:format("~n~ts~n", [coding_agent_ansi:dim("No steps defined yet.")]),
+            io:format("~ts~n~n", [coding_agent_ansi:dim("Ask the agent to break the plan into steps in meticulous mode.")]);
+        _ ->
+            io:format("~n~ts~n", [coding_agent_ansi:bright_yellow("═══ Implementation Steps ═══")]),
+            lists:foldl(fun({Idx, Step}, _) ->
+                Title = maps:get(title, Step, <<"untitled">>),
+                Desc = maps:get(description, Step, <<"">>),
+                Marker = case Idx < CurrentIdx of
+                    true -> coding_agent_ansi:bright_green("✓");
+                    false -> case Idx =:= CurrentIdx of
+                        true -> coding_agent_ansi:bright_yellow("▶");
+                        false -> coding_agent_ansi:dim("○")
+                    end
+                end,
+                io:format("  ~ts Step ~p: ~ts~n", [Marker, Idx + 1, Title]),
+                case byte_size(Desc) > 0 of
+                    true ->
+                        DescPreview = case byte_size(Desc) > 120 of
+                            true -> <<(binary:part(Desc, 0, 120))/binary, "...">>;
+                            false -> Desc
+                        end,
+                        io:format("       ~ts~n", [coding_agent_ansi:dim(binary_to_list(DescPreview))]);
+                    false -> ok
+                end,
+                Idx
+            end, 0, lists:zip(lists:seq(0, length(Steps) - 1), Steps)),
+            io:format("~n~ts~n~n", [coding_agent_ansi:bright_yellow("════════════════════════════")])
+    end,
+    {continue, History, Mode};
+
+process_command(SessionId, History, "confirm" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    Steps = get_meticulous_steps(),
+    PlanText = get_current_plan(),
+    case Steps of
+        [] ->
+            io:format("~n~ts No steps defined yet.~n", [coding_agent_ansi:bright_red("✗")]),
+            io:format("~ts Ask the agent to break the plan into steps first.~n~n", [coding_agent_ansi:dim("")]);
+        _ ->
+            save_steps_to_files(),
+            io:format("~n~ts Plan confirmed with ~p steps.~n", [coding_agent_ansi:bright_green("✓"), length(Steps)]),
+            io:format("~ts Step files saved to ~ts~n", [coding_agent_ansi:dim(""), coding_agent_ansi:bright_white(?PLAN_DIR)]),
+            io:format("~ts Use ~ts to execute the next step.~n~n", [coding_agent_ansi:dim(""), coding_agent_ansi:bright_white("/exec")])
+    end,
+    {continue, History, Mode};
+
+process_command(SessionId, History, "exec" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    Steps = get_meticulous_steps(),
+    CurrentIdx = get_current_step_index(),
+    case Steps of
+        [] ->
+            io:format("~n~ts No steps to execute. Use /confirm first.~n~n", [coding_agent_ansi:bright_red("✗")]),
+            {continue, History, Mode};
+        _ when CurrentIdx >= length(Steps) ->
+            io:format("~n~ts All steps completed! Use /build to continue freely.~n~n", [coding_agent_ansi:bright_green("✓")]),
+            {continue, History, build};
+        _ ->
+            Step = lists:nth(CurrentIdx + 1, Steps),
+            Title = maps:get(title, Step, <<"untitled">>),
+            Desc = maps:get(description, Step, <<"">>),
+            io:format("~n~ts Executing Step ~p/~p: ~ts~n", [coding_agent_ansi:bright_yellow("▶"), CurrentIdx + 1, length(Steps), Title]),
+            io:format("~ts~n~n", [coding_agent_ansi:dim(binary_to_list(Desc))]),
+            StepPrompt = iolist_to_binary([
+                <<"[STEP EXECUTION] Execute step ">>, integer_to_binary(CurrentIdx + 1), <<" of ">>, integer_to_binary(length(Steps)), <<": ">>, Title, <<"\n\n">>,
+                <<"Description: ">>, Desc, <<"\n\n">>,
+                <<"Execute ONLY this step. Focus on completing this specific task.">>
+            ]),
+            set_current_step_index(CurrentIdx + 1),
+            save_steps_to_files(),
+            process_message(SessionId, History, binary_to_list(StepPrompt), build, 0),
+            {continue, History, Mode}
+    end;
+
+process_command(SessionId, History, "skip " ++ NumStr, Mode) ->
+    case catch list_to_integer(string:trim(NumStr)) of
+        Num when is_integer(Num), Num > 0 ->
+            Steps = get_meticulous_steps(),
+            case Num > length(Steps) of
+                true ->
+                    io:format("~n~ts Step ~p does not exist.~n~n", [coding_agent_ansi:bright_red("✗"), Num]);
+                false ->
+                    set_current_step_index(Num),
+                    io:format("~n~ts Skipping to step ~p.~n~n", [coding_agent_ansi:bright_green("✓"), Num])
+            end;
+        _ ->
+            io:format("~n~ts Invalid step number. Use /skip <n>~n~n", [coding_agent_ansi:bright_red("✗")])
+    end,
     {continue, History, Mode};
 
 
@@ -921,6 +1128,36 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
                 <<"2. Implement the plan you created\n">>,
                 <<"3. Make changes to files\n">>,
                 <<"\n">>
+            ]);
+        meticulous ->
+            Steps = get_meticulous_steps(),
+            StepIdx = get_current_step_index(),
+            PlanText = get_current_plan(),
+            StepsContext = case Steps of
+                [] -> <<"No steps defined yet. Ask the agent to break the plan into steps.\n">>;
+                _ ->
+                    StepLines = lists:map(fun({Idx, S}) ->
+                        Marker = case Idx < StepIdx of
+                            true -> <<"✓">>;
+                            false -> case Idx =:= StepIdx of
+                                true -> <<"▶">>;
+                                false -> <<"○">>
+                            end
+                        end,
+                        iolist_to_binary([Marker, <<" Step ">>, integer_to_binary(Idx + 1), <<": ">>,
+                                         maps:get(title, S, <<"untitled">>), <<"\n">>])
+                    end, lists:zip(lists:seq(0, length(Steps) - 1), Steps)),
+                    iolist_to_binary(StepLines)
+            end,
+            iolist_to_binary([
+                <<"\n[METICULOUS MODE] You are in meticulous mode.\n">>,
+                <<"1. First, discuss the plan with the user\n">>,
+                <<"2. When the plan is agreed, break it into numbered steps\n">>,
+                <<"3. Output each step as a structured block:\n">>,
+                <<"   <<<STEP>>>\n   Title: <short title>\n   Description: <what to do>\n   Files: <affected files>\n   <<<ENDSTEP>>>\n">>,
+                <<"4. After all steps, the user will confirm and execute one by one\n">>,
+                <<"5. DO NOT execute any code or file operations yet\n">>,
+                <<"\nCURRENT PLAN:\n">>, PlanText, <<"\n\nCURRENT STEPS:\n">>, StepsContext, <<"\n">>
             ])
     end,
     
@@ -931,6 +1168,24 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
         case coding_agent_session:ask_stream(SessionId, EnrichedMessage, StreamCb) of
             {ok, Response, _Thinking} ->
                 io:format("~n"),
+                case Mode of
+                    meticulous ->
+                        NewSteps = parse_steps_from_response(Response),
+                        case NewSteps of
+                            [] -> ok;
+                            _ ->
+                                ExistingSteps = get_meticulous_steps(),
+                                AllSteps = ExistingSteps ++ NewSteps,
+                                set_meticulous_steps(AllSteps),
+                                io:format("~ts ~p step(s) detected and saved.~n",
+                                          [coding_agent_ansi:bright_green("✓"), length(NewSteps)]),
+                                io:format("~ts Use ~ts to view or ~ts to confirm.~n~n",
+                                          [coding_agent_ansi:dim(""),
+                                           coding_agent_ansi:bright_white("/steps"),
+                                           coding_agent_ansi:bright_white("/confirm")])
+                        end;
+                    _ -> ok
+                end,
                 {continue, NewHistory, Mode};
             {error, session_not_found} ->
                 io:format("~n~ts~n", [coding_agent_ansi:bright_yellow("Session expired. Creating new session...")]),
