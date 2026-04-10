@@ -1308,12 +1308,18 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
     
     EnrichedMessage = iolist_to_binary([ModeContext, Message]),
     
+    %% Start spinner process
+    SpinnerPid = start_spinner(),
+    
     try
-        io:format("~s~n", [coding_agent_ansi:dim("  Waiting for response...")]),
         StreamCb = fun stream_callback/3,
-        case coding_agent_session:ask_stream(SessionId, EnrichedMessage, StreamCb) of
+        Result = coding_agent_session:ask_stream(SessionId, EnrichedMessage, StreamCb),
+        
+        %% Stop spinner
+        stop_spinner(SpinnerPid),
+        
+        case Result of
                 {ok, Response, _Thinking} ->
-                    io:format("~n"),
                     case Mode of
                     meticulous ->
                         NewSteps = parse_steps_from_response(Response),
@@ -1354,6 +1360,8 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
             end
         catch
             exit:{timeout, {gen_server, call, [_Pid2, Call, _Timeout]}} ->
+                %% Stop spinner on error
+                stop_spinner(SpinnerPid),
                 io:format("~n~ts~n", [coding_agent_ansi:bright_red("Request timed out")]),
                 io:format("  Called: ~p~n", [element(1, Call)]),
                 case RetryCount < 2 of
@@ -1369,11 +1377,13 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
                         {continue, History, Mode}
                 end;
             error:undef:StacktraceUndef ->
+                stop_spinner(SpinnerPid),
                 [{M, F, A, _} | _] = StacktraceUndef,
                 io:format("~n~ts~n", [coding_agent_ansi:bright_yellow("Undefined function error:")]),
                 io:format("  ~p:~p/~p~n", [M, F, A]),
                 io:format("~ts~n", [coding_agent_ansi:bright_yellow("Please recompile and restart.")]);
             Type2:Error2:Stacktrace2 ->
+                stop_spinner(SpinnerPid),
                 io:format("~n~ts ~p:~p~n", [coding_agent_ansi:bright_red("Session crashed:"), Type2, Error2]),
                 try
                     case whereis(coding_agent_healer) of
@@ -1857,3 +1867,65 @@ load_mcp_servers() ->
                 end
             end, Servers)
     end.
+
+%% =============================================================================
+%% Spinner Functions - Animated waiting indicator
+%% =============================================================================
+
+-define(SPINNER_FRAMES, ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]).
+
+%% @doc Start a spinner process that displays an animated waiting indicator
+start_spinner() ->
+    Parent = self(),
+    spawn(fun() -> spinner_loop(Parent, 0, os:system_time(millisecond)) end).
+
+%% @doc Stop the spinner process
+stop_spinner(Pid) when is_pid(Pid) ->
+    Ref = monitor(process, Pid),
+    Pid ! stop,
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after
+        1000 -> ok
+    end;
+stop_spinner(_) ->
+    ok.
+
+%% @doc Spinner animation loop
+spinner_loop(Parent, FrameIdx, StartTime) ->
+    receive
+        stop ->
+            io:format("\r~s\r", [coding_agent_ansi:clear_line()]),
+            ok
+    after
+        80 ->
+            %% Calculate elapsed time
+            Elapsed = (os:system_time(millisecond) - StartTime) div 1000,
+            
+            %% Get spinner frame
+            Frames = ?SPINNER_FRAMES,
+            Frame = lists:nth((FrameIdx rem length(Frames)) + 1, Frames),
+            
+            %% Build elapsed time string
+            ElapsedStr = format_elapsed(Elapsed),
+            
+            %% Clear line and show spinner with elapsed time
+            Line = io_lib:format("~s~s ~s~s", [
+                coding_agent_ansi:clear_line(),
+                coding_agent_ansi:cyan(Frame),
+                coding_agent_ansi:dim("Waiting for response"),
+                ElapsedStr
+            ]),
+            io:format("\r~s", [Line]),
+            
+            %% Continue spinning
+            spinner_loop(Parent, FrameIdx + 1, StartTime)
+    end.
+
+%% @doc Format elapsed seconds into human-readable string
+format_elapsed(Secs) when Secs < 60 ->
+    io_lib:format("~s (~Bs)", [coding_agent_ansi:dim("..."), Secs]);
+format_elapsed(Secs) ->
+    Mins = Secs div 60,
+    SecsRem = Secs rem 60,
+    io_lib:format("~s (~Bm ~Bs)", [coding_agent_ansi:dim("..."), Mins, SecsRem]).
