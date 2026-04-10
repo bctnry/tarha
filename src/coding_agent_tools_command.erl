@@ -215,7 +215,7 @@ execute_parallel_impl(Calls) when is_list(Calls) ->
         <<"results">> => Results,
         <<"count">> => length(Calls)
     };
-execute_parallel_impl(Calls) ->
+execute_parallel_impl(_Calls) ->
     #{<<"success">> => false, <<"error">> => <<"calls must be an array">>}.
 
 collect_parallel_results([], Results) ->

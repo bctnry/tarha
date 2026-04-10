@@ -334,7 +334,7 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-send_initialize(State = #state{port = Port}) ->
+send_initialize(#state{port = Port}) ->
     Id = 1,
     Msg = #{
         <<"jsonrpc">> => <<"2.0">>,
@@ -405,7 +405,7 @@ send_stdio(Port, Msg) ->
     Data = iolist_to_binary([jsx:encode(Msg), $\n]),
     Port ! {self(), {command, Data}}.
 
-send_notification(State = #state{port = Port}, Method, Params) ->
+send_notification(#state{port = Port}, Method, Params) ->
     Msg = #{
         <<"jsonrpc">> => <<"2.0">>,
         <<"method">> => Method,

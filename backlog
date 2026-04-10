@@ -1,0 +1,3 @@
++ ansi coloring for strings like "thinking" and "[tool]
++ add an indicator (ansi based)
++ add support for env var NO_COLOR which turns off ansi escape sequence coloring in all places

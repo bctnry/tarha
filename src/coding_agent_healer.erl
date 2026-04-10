@@ -463,8 +463,8 @@ write_crash_report(CrashId) ->
         [] -> {error, not_found};
         [{CrashId, CrashData}] ->
             filelib:ensure_dir(?CRASH_REPORT_DIR ++ "/"),
-            Timestamp = maps:get(timestamp, CrashData, erlang:system_time(millisecond)),
-            Analysis = maps:get(analysis, CrashData, #{}),
+            _Timestamp = maps:get(timestamp, CrashData, erlang:system_time(millisecond)),
+            _Analysis = maps:get(analysis, CrashData, #{}),
             
             ReportContent = generate_crash_report_content(CrashId, CrashData),
             Filename = filename:join(?CRASH_REPORT_DIR, binary_to_list(CrashId) ++ ".md"),
@@ -561,7 +561,7 @@ format_stacktrace_list([_ | Rest]) ->
 write_fix_report(CrashData, Action, Result) ->
     filelib:ensure_dir(?CRASH_REPORT_DIR ++ "/"),
     CrashId = maps:get(id, CrashData, <<"unknown">>),
-    Timestamp = erlang:system_time(millisecond),
+    _Timestamp = erlang:system_time(millisecond),
     
     ReportContent = generate_fix_report_content(CrashId, Action, Result),
     Filename = filename:join(?CRASH_REPORT_DIR, "fix-" ++ binary_to_list(CrashId) ++ ".md"),
@@ -675,36 +675,6 @@ find_source_file(Module) ->
             filename:join(SrcDir, atom_to_list(Module) ++ ".erl")
     end.
 
-find_case_clause_location(Content, _F, _A) ->
-    % Find the last clause before 'end' in a case statement
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    find_case_end(Lines, [], none, none).
-
-find_case_end([], _Acc, none, none) ->
-    {error, not_found};
-find_case_end([], Acc, CaseStart, CaseEnd) when CaseStart =/= none, CaseEnd =/= none ->
-    {ok, CaseStart, CaseEnd};
-find_case_end([], _Acc, _CaseStart, _CaseEnd) ->
-    {error, not_found};
-find_case_end([Line | Rest], Acc, CaseStart, CaseEnd) ->
-    Trimmed = string:trim(Line),
-    case CaseStart of
-        none ->
-            case binary:match(Trimmed, <<"case ">>) of
-                {0, _} ->
-                    find_case_end(Rest, [Line | Acc], length(Acc), none);
-                _ ->
-                    find_case_end(Rest, [Line | Acc], none, none)
-            end;
-        _ ->
-            case binary:match(Trimmed, <<"end">>) of
-                {0, _} ->
-                    find_case_end(Rest, [Line | Acc], CaseStart, length(Acc));
-                _ ->
-                    find_case_end(Rest, [Line | Acc], CaseStart, CaseEnd)
-            end
-    end.
-
 %% Fix badarg - read the crash line and fix the pattern directly
 fix_badarg(CrashData) ->
     #{stacktrace := Stacktrace} = CrashData,
@@ -737,7 +707,7 @@ fix_badarg(CrashData) ->
 
 find_user_code_location([]) ->
     {error, no_user_code_in_stacktrace};
-find_user_code_location([{M, _F, _A, Info} | Rest]) ->
+find_user_code_location([{_M, _F, _A, Info} | Rest]) ->
     File = proplists:get_value(file, Info, ""),
     Line = proplists:get_value(line, Info, 0),
     case is_user_code(File) of
@@ -758,7 +728,7 @@ filename_to_module(File) ->
     BaseName = filename:basename(File, ".erl"),
     list_to_atom(BaseName).
 
-fix_badarg_in_line(File, LineNum, LineContent, AllLines) ->
+fix_badarg_in_line(_File, LineNum, LineContent, AllLines) ->
     % Common badarg patterns:
     % 1. io_lib:format("~s", [[Integer]]) - Unicode codepoint passed to ~s
     % 2. binary_to_list(Incomplete) - incomplete binary
@@ -776,7 +746,7 @@ fix_badarg_in_line(File, LineNum, LineContent, AllLines) ->
 find_badarg_pattern(Line) ->
     % Pattern: io_lib:format with unicode integer list
     case binary:match(Line, <<"io_lib:format">>) of
-        {Pos, _} ->
+        {_Pos, _} ->
             % Check for ~s with integer list argument
             case extract_format_args(Line) of
                 {ok, FormatStr, Args} ->
@@ -794,8 +764,7 @@ find_badarg_pattern(Line) ->
             try_other_badarg_patterns(Line)
     end.
 
-try_other_badarg_patterns(Line) ->
-    % Add more patterns here as we discover them
+try_other_badarg_patterns(_Line) ->
     {error, unknown_badarg_pattern}.
 
 analyze_format_badarg(FormatStr, Args) ->
@@ -841,7 +810,7 @@ extract_format_args(Line) ->
     end.
 
 find_closing_paren(<<>>, _Depth, _Acc) -> error;
-find_closing_paren(<<$), Rest/binary>>, 1, Acc) -> {ok, Acc};
+find_closing_paren(<<$), _Rest/binary>>, 1, Acc) -> {ok, Acc};
 find_closing_paren(<<$), Rest/binary>>, Depth, Acc) -> 
     find_closing_paren(Rest, Depth - 1, <<Acc/binary, $)>>);
 find_closing_paren(<<$(, Rest/binary>>, Depth, Acc) -> 
@@ -921,7 +890,7 @@ fix_case_clause_line(Line, LineNum, Lines) ->
     case string:find(Line, <<"case">>) of
         nomatch ->
             case find_enclosing_construct(Lines, LineNum, <<"case">>, <<"end">>) of
-                {ok, CaseStart, CaseEnd} ->
+                {ok, _CaseStart, CaseEnd} ->
                     Indent = get_line_indent(Line),
                     Wildcard = <<Indent/binary, "    _ -> ok">>,
                     {Before, After} = lists:split(CaseEnd - 1, Lines),
@@ -942,7 +911,7 @@ fix_if_clause(CrashData) ->
 
 fix_if_clause_line(Line, LineNum, Lines) ->
     case find_enclosing_construct(Lines, LineNum, <<"if">>, <<"end">>) of
-        {ok, IfStart, IfEnd} ->
+        {ok, _IfStart, IfEnd} ->
             Indent = get_line_indent(Line),
             TrueClause = <<Indent/binary, "    true -> ok">>,
             {Before, After} = lists:split(IfEnd - 1, Lines),
@@ -959,7 +928,7 @@ fix_try_clause(CrashData) ->
 
 fix_try_clause_line(Line, LineNum, Lines) ->
     case find_enclosing_construct(Lines, LineNum, <<"try">>, <<"end">>) of
-        {ok, TryStart, TryEnd} ->
+        {ok, _TryStart, TryEnd} ->
             Indent = get_line_indent(Line),
             CatchClause = <<Indent/binary, "catch">>,
             CatchAll = <<Indent/binary, "    _:_ -> ok">>,
@@ -974,7 +943,7 @@ fix_try_clause_line(Line, LineNum, Lines) ->
 fix_function_clause(CrashData) ->
     fix_at_crash_line(CrashData, fun fix_function_clause_line/3).
 
-fix_function_clause_line(Line, LineNum, Lines) ->
+fix_function_clause_line(Line, _LineNum, _Lines) ->
     case binary:match(Line, <<"(">>) of
         {Pos, _} ->
             <<FuncName:Pos/binary, _/binary>> = Line,
@@ -1016,7 +985,7 @@ find_enclosing_construct(Lines, LineNum, StartKeyword, EndKeyword) ->
             {error, Reason}
     end.
 
-find_construct_start(Lines, LineNum, Keyword) when LineNum < 1 ->
+find_construct_start(_Lines, LineNum, _Keyword) when LineNum < 1 ->
     {error, not_found};
 find_construct_start(Lines, LineNum, Keyword) ->
     Line = lists:nth(LineNum, Lines),
@@ -1027,7 +996,7 @@ find_construct_start(Lines, LineNum, Keyword) ->
             find_construct_start(Lines, LineNum - 1, Keyword)
     end.
 
-find_construct_end(Lines, LineNum, Keyword) when LineNum > length(Lines) ->
+find_construct_end(Lines, LineNum, _Keyword) when LineNum > length(Lines) ->
     {error, not_found};
 find_construct_end(Lines, LineNum, Keyword) ->
     Line = lists:nth(LineNum, Lines),
@@ -1036,223 +1005,6 @@ find_construct_end(Lines, LineNum, Keyword) ->
             {ok, LineNum};
         _ ->
             find_construct_end(Lines, LineNum + 1, Keyword)
-    end.
-
-%% Helper functions for fixes
-
-add_if_true_clause(Content) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    % Find 'if' statements and add 'true ->' clause before 'end'
-    NewLines = add_if_true_to_lines(Lines, []),
-    iolist_to_binary(string:join([binary_to_list(L) || L <- NewLines], "\n")).
-
-add_if_true_to_lines([], Acc) ->
-    lists:reverse(Acc);
-add_if_true_to_lines([Line | Rest], Acc) ->
-    Trimmed = string:trim(Line),
-    case binary:match(Trimmed, <<"end">>) of
-        {0, _} ->
-            % Check if previous lines are from an if statement
-            case find_if_start(Acc) of
-                true ->
-                    % Add 'true -> ok' before 'end'
-                    add_if_true_to_lines(Rest, [Line, <<"            true -> ok">> | Acc]);
-                false ->
-                    add_if_true_to_lines(Rest, [Line | Acc])
-            end;
-        _ ->
-            add_if_true_to_lines(Rest, [Line | Acc])
-    end.
-
-find_if_start([]) -> false;
-find_if_start([Line | Rest]) ->
-    Trimmed = string:trim(Line),
-    case binary:match(Trimmed, <<" if">>) of
-        {_, _} -> true;
-        _ -> find_if_start(Rest)
-    end.
-
-add_try_catch_clause(Content) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    % Find 'try' statements and add 'catch' clause
-    NewLines = add_catch_to_lines(Lines, []),
-    iolist_to_binary(string:join([binary_to_list(L) || L <- NewLines], "\n")).
-
-add_catch_to_lines([], Acc) ->
-    lists:reverse(Acc);
-add_catch_to_lines([Line | Rest], Acc) ->
-    Trimmed = string:trim(Line),
-    case binary:match(Trimmed, <<"end">>) of
-        {0, _} ->
-            % Check if this is a try block
-            case find_try_start(Acc) of
-                true ->
-                    % Add 'catch' clause before 'end'
-                    add_catch_to_lines(Rest, [Line, <<"        catch">>, <<"            _:_ -> ok">> | Acc]);
-                false ->
-                    add_catch_to_lines(Rest, [Line | Acc])
-            end;
-        _ ->
-            add_catch_to_lines(Rest, [Line | Acc])
-    end.
-
-find_try_start([]) -> false;
-find_try_start([Line | Rest]) ->
-    Trimmed = string:trim(Line),
-    case binary:match(Trimmed, <<"try">>) of
-        {0, _} -> true;
-        _ -> find_try_start(Rest)
-    end.
-
-generate_arg_validation(badarg, Arity) ->
-    % Get arg names from function spec or generate placeholder names
-    Args = [list_to_binary(["Arg", integer_to_list(N)]) || N <- lists:seq(1, Arity)],
-    Guards = [io_lib:format("is_binary(~s) orelse is_list(~s) orelse is_atom(~s)", [A, A, A]) || A <- Args],
-    io_lib:format("when ~s", [string:join(Guards, ",\n    ")]);
-generate_arg_validation(_Reason, _Arity) ->
-    "".
-
-insert_validation(Content, ClauseStart, _ClauseEnd, ValidationCode) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    {Before, After} = lists:split(ClauseStart + 1, Lines),
-    % Insert validation after the first line of the clause
-    NewLines = Before ++ [ValidationCode] ++ After,
-    iolist_to_binary(string:join([binary_to_list(L) || L <- NewLines], "\n")).
-
-add_wildcard_clause(Content, F, A, InsertPos) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    % Generate wildcard clause
-    Args = [<<"_", (integer_to_binary(N))/binary>> || N <- lists:seq(1, A)],
-    WildcardClause = io_lib:format("~s(~s) ->\n    erlang:error(not_implemented).", 
-        [F, string:join([binary_to_list(A) || A <- Args], ", ")]),
-    {Before, After} = lists:split(InsertPos + 1, Lines),
-    NewLines = Before ++ [iolist_to_binary(WildcardClause)] ++ After,
-    iolist_to_binary(string:join([binary_to_list(L) || L <- NewLines], "\n")).
-
-add_function_clause(Content, F, A) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    % Find the function definition
-    {FuncLines, RestLines} = find_function_lines(Lines, atom_to_binary(F, utf8), A),
-    % Add a catch-all clause
-    Args = [<<"_", (integer_to_binary(N))/binary>> || N <- lists:seq(1, A)],
-    CatchAll = iolist_to_binary(io_lib:format("~s(~s) ->\n    erlang:error(not_implemented).", 
-        [F, string:join([binary_to_list(A) || A <- Args], ", ")])),
-    % Insert before the next function or at the end
-    NewLines = FuncLines ++ [CatchAll] ++ RestLines,
-    iolist_to_binary(string:join([binary_to_list(L) || L <- NewLines], "\n")).
-
-find_function_lines(Lines, FName, Arity) ->
-    find_function_lines(Lines, FName, Arity, [], []).
-
-find_function_lines([], _FName, _Arity, FuncAcc, RestAcc) ->
-    {lists:reverse(FuncAcc), lists:reverse(RestAcc)};
-find_function_lines([Line | Rest], FName, Arity, FuncAcc, RestAcc) ->
-    case binary:match(Line, <<FName/binary, "(">>) of
-        {0, _} ->
-            % Found function start, collect until next function or end
-            collect_function_lines(Rest, [Line | FuncAcc], RestAcc, Arity);
-        _ ->
-            find_function_lines(Rest, FName, Arity, FuncAcc, [Line | RestAcc])
-    end.
-
-collect_function_lines([], FuncAcc, RestAcc, _Arity) ->
-    {lists:reverse(FuncAcc), lists:reverse(RestAcc)};
-collect_function_lines([Line | Rest], FuncAcc, RestAcc, Arity) ->
-    % Check for next function (starts with lowercase letter or -)
-    FirstChar = binary:first(string:trim(Line)),
-    case FirstChar of
-        $- -> {lists:reverse(FuncAcc), lists:reverse([Line | RestAcc])};
-        C when C >= $a, C =< $z ->
-            % Could be next function, stop collecting
-            {lists:reverse(FuncAcc), lists:reverse([Line | RestAcc])};
-        _ ->
-            collect_function_lines(Rest, [Line | FuncAcc], RestAcc, Arity)
-    end.
-
-find_function_clause(Content, F, Arity) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    find_function_clause(Lines, atom_to_binary(F, utf8), Arity, 0).
-
-find_function_clause([], _F, _Arity, _Line) ->
-    {error, not_found};
-find_function_clause([Line | Rest], F, Arity, LineNum) ->
-    % Strip leading whitespace to handle indented functions
-    StrippedLine = binary:replace(Line, <<" ">>, <<>>, [global, {leading}]),
-    StrippedLine2 = binary:replace(StrippedLine, <<"\t">>, <<>>, [global, {leading}]),
-    
-    % Match function name at start of stripped line
-    case binary:match(StrippedLine2, <<F/binary, "(">>) of
-        {0, _} ->
-            % Found function definition - check arity
-            case count_args(Line, Arity) of
-                true -> {ok, LineNum, LineNum + 1};
-                false -> find_function_clause(Rest, F, Arity, LineNum + 1)
-            end;
-        _ ->
-            find_function_clause(Rest, F, Arity, LineNum + 1)
-    end.
-
-is_valid_func_start(<<>>) -> true;
-is_valid_func_start(Before) ->
-    case binary:last(Before) of
-        $\s -> true;
-        $\t -> true;
-        $\n -> true;
-        $- -> true;
-        _ -> false
-    end.
-
-count_args(Line, Arity) ->
-    case binary:match(Line, <<"(">>) of
-        {Start, _} ->
-            % Get everything after the opening paren
-            <<_:Start/binary, Rest/binary>> = Line,
-            case binary:match(Rest, <<")">>) of
-                {End, _} ->
-                    % Get the part between ( and )
-                    <<ArgsPart:End/binary, _/binary>> = Rest,
-                    % Count commas + 1 = number of args
-                    % For zero args: no commas, split returns 1 element (empty)
-                    % For 1 arg: no commas, split returns 1 element  
-                    % For n args: n-1 commas, split returns n elements
-                    Parts = binary:split(ArgsPart, <<",">>, [global]),
-                    % Filter out empty parts (handles whitespace)
-                    NonEmptyParts = [P || P <- Parts, byte_size(P) > 0, P =/= <<$\s>>, P =/= <<$\t>>],
-                    length(NonEmptyParts) =:= Arity;
-                none ->
-                    false
-            end;
-        none ->
-            false
-    end.
-
-add_catch_all_case(Content, StartLine, EndLine) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    {Before, CaseBlock} = lists:split(StartLine - 1, Lines),
-    {CaseLines, After} = lists:split(EndLine - StartLine + 1, CaseBlock),
-
-    LastLine = lists:last(CaseLines),
-    Indent = find_indent(LastLine),
-    CatchAll = <<Indent/binary, "_ -> ok">>,
-    
-    case binary:match(LastLine, <<"end">>) of
-        {0, _} ->
-            NewCaseLines = lists:droplast(CaseLines) ++ [CatchAll, <<"end">>],
-            iolist_to_binary(lists:join(<<"\n">>, Before ++ NewCaseLines ++ After));
-        _ ->
-            Content
-    end.
-
-find_indent(Line) ->
-    case binary:match(Line, <<"end">>) of
-        {Pos, _} when Pos > 0 ->
-            binary:part(Line, {0, Pos});
-        _ ->
-            case binary:first(Line) of
-                $\s -> <<$\s, (find_indent(binary:part(Line, {1, byte_size(Line) - 1}))/binary)>>;
-                $\t -> <<$\t, (find_indent(binary:part(Line, {1, byte_size(Line) - 1}))/binary)>>;
-                _ -> <<>>
-            end
     end.
 
 extract_exports(Content) ->

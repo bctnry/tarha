@@ -19,5 +19,14 @@ session:
   max_messages: 100
   max_context_ratio: 0.85
 
+# Lazy compaction settings
+# When enabled (default), context compaction only happens when the LLM
+# returns a context overflow error, rather than proactively compacting.
+# This maximizes context utilization and avoids unnecessary summarization.
+compaction:
+  enabled: true           # Enable lazy compaction (true) or use preemptive (false)
+  target_ratio: 0.7       # When compacting, keep 70% of messages
+  max_retries: 3          # Max compaction retries before giving up
+
 repl:
   no_color: false

@@ -18,25 +18,6 @@
 -define(PLAN_DIR, ".tarha/plans").
 -define(MENU_WIDTH, 60).
 
-%% Helper to calculate visible string length (excluding ANSI codes)
-visible_length(Str) when is_binary(Str) ->
-    visible_length(binary_to_list(Str));
-visible_length(Str) when is_list(Str) ->
-    % Remove ANSI escape sequences for length calculation
-    NoAnsi = re:replace(Str, "\e\[[0-9;]*m", "", [global, {return, list}]),
-    length(unicode:characters_to_list(NoAnsi, utf8)).
-
-%% Helper to pad a string to a specific width
-pad_to_width(Str, Width) ->
-    VisibleLen = visible_length(Str),
-    Padding = max(0, Width - VisibleLen),
-    Str ++ lists:duplicate(Padding, $\s).
-
-%% Helper to create a menu line with proper padding
-menu_line(Content) ->
-    A = coding_agent_ansi,
-    A:bright_cyan("║ ") ++ pad_to_width(Content, ?MENU_WIDTH - 4) ++ A:bright_cyan(" ║").
-
 start() ->
     start([]).
 start(_Args) ->
@@ -114,12 +95,6 @@ get_model() ->
 flush_pending_output() ->
     io:format("", []),
     ok.
-
-get_current_mode() ->
-    case get(?MODE_KEY) of
-        undefined -> build;
-        Mode -> Mode
-    end.
 
 set_current_mode(Mode) ->
     put(?MODE_KEY, Mode).
@@ -323,7 +298,7 @@ process_input_impl(SessionId, History, Input, Mode) ->
     % Convert binary to list first
     process_input_impl(SessionId, History, io_lib:format("~s", [Input]), Mode).
 
-process_command(SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~ts~n", [coding_agent_ansi:bright_yellow("Commands:")]),
     io:format("  " ++ coding_agent_ansi:bright_white("/help") ++ coding_agent_ansi:dim("           - Show this help") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/status") ++ coding_agent_ansi:dim("         - Show session & memory status") ++ "~n"),
@@ -451,7 +426,7 @@ process_command(SessionId, History, "history" ++ Rest, Mode) when Rest =:= []; h
     io:format("~n"),
     {continue, History, Mode};
     
-process_command(SessionId, History, "tools" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "tools" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Tools = coding_agent_tools:tools(),
     io:format("~s (~p):~n", [coding_agent_ansi:bright_yellow("Available Tools"), length(Tools)]),
     lists:foreach(fun(Tool) ->
@@ -557,7 +532,7 @@ process_command(_SessionId, History, "model " ++ ModelName, Mode) ->
             {continue, History, Mode}
     end;
 
-process_command(SessionId, History, "switch " ++ ModelName, Mode) ->
+process_command(_SessionId, History, "switch " ++ ModelName, Mode) ->
     Name = safe_trim(ModelName),
     io:format(coding_agent_ansi:dim("Switching to model:") ++ " ~s...~n", [Name]),
     case coding_agent_ollama:switch_model(Name) of
@@ -601,7 +576,7 @@ process_command(SessionId, History, "context " ++ SizeStr, Mode) ->
     end,
     {continue, History, Mode};
     
-process_command(SessionId, History, "modules" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "modules" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Modules = try coding_agent_self:get_modules() of
         L when is_list(L) -> L;
         {ok, L} -> L;
@@ -619,7 +594,7 @@ process_command(SessionId, History, "modules" ++ Rest, Mode) when Rest =:= []; h
     io:format("~n"),
     {continue, History, Mode};
     
-process_command(SessionId, History, "reload" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "reload" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     case safe_trim(Rest) of
         "" ->
             io:format(coding_agent_ansi:dim("Reloading all modules...") ++ "~n"),
@@ -674,7 +649,7 @@ process_command(SessionId, History, "reload" ++ Rest, Mode) when Rest =:= []; hd
             end
     end;
     
-process_command(SessionId, History, "checkpoint" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "checkpoint" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     case coding_agent_self:create_checkpoint() of
         #{success := true, id := Id} ->
             io:format(coding_agent_ansi:bright_green("✓ Checkpoint created:") ++ " ~s~n~n", [Id]);
@@ -683,7 +658,7 @@ process_command(SessionId, History, "checkpoint" ++ Rest, Mode) when Rest =:= []
     end,
     {continue, History, Mode};
     
-process_command(SessionId, History, "restore " ++ CkptId, Mode) ->
+process_command(_SessionId, History, "restore " ++ CkptId, Mode) ->
     Id = list_to_binary(safe_trim(CkptId)),
     case coding_agent_self:restore_checkpoint(Id) of
         #{success := true} ->
@@ -701,7 +676,7 @@ process_command(SessionId, History, "clear" ++ Rest, Mode) when Rest =:= []; hd(
     end,
     {continue, History, Mode};
     
-process_command(SessionId, History, "trim" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "trim" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format(coding_agent_ansi:dim("Trimming memory...") ++ "~n"),
     try coding_agent_process_monitor:trim() of
         _ -> ok
@@ -733,7 +708,7 @@ process_command(SessionId, History, "compact" ++ Rest, Mode) when Rest =:= []; h
     end,
     {continue, History, Mode};
 
-process_command(SessionId, History, "crashes" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "crashes" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Crashes = try coding_agent_healer:get_crashes() of
         L when is_list(L) -> L;
         {ok, L} -> L;
@@ -752,7 +727,7 @@ process_command(SessionId, History, "crashes" ++ Rest, Mode) when Rest =:= []; h
     io:format("Use /reports to list crash report files~n~n"),
     {continue, History, Mode};
 
-process_command(SessionId, History, "reports" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "reports" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     ReportDir = ".coding_agent_reports",
     case filelib:is_dir(ReportDir) of
         false ->
@@ -769,7 +744,7 @@ process_command(SessionId, History, "reports" ++ Rest, Mode) when Rest =:= []; h
             {continue, History, Mode}
     end;
     
-process_command(SessionId, History, "fix " ++ CrashId, Mode) ->
+process_command(_SessionId, History, "fix " ++ CrashId, Mode) ->
     Id = list_to_binary(safe_trim(CrashId)),
     io:format("Attempting auto-fix for ~s...~n", [Id]),
     case coding_agent_healer:auto_fix(Id) of
@@ -780,7 +755,7 @@ process_command(SessionId, History, "fix " ++ CrashId, Mode) ->
     end,
     {continue, History, Mode};
     
-process_command(SessionId, History, "sessions" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "sessions" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~n~ts~n", [coding_agent_ansi:bright_cyan("Saved Sessions:")]),
     case coding_agent_session_store:list_sessions_with_metadata() of
         Sessions when is_list(Sessions) ->
@@ -836,7 +811,7 @@ process_command(_SessionId, History, "resume" ++ Rest, Mode) when Rest =:= []; h
             {continue, History, Mode}
     end;
 
-process_command(SessionId, History, "load " ++ SessionIdArg, Mode) ->
+process_command(_SessionId, History, "load " ++ SessionIdArg, Mode) ->
     LoadId = list_to_binary(string:trim(SessionIdArg)),
     io:format("Loading session ~s...~n", [LoadId]),
     case coding_agent_session:load_session(LoadId) of
@@ -868,12 +843,12 @@ process_command(_SessionId, History, "cwd" ++ Rest, Mode) when Rest =:= []; hd(R
     io:format("~ts~n", [Cwd]),
     {continue, History, Mode};
 
-process_command(_SessionId, History, "quit" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "quit" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     save_history(History),
     io:format("Goodbye!~n"),
     stop;
     
-process_command(_SessionId, History, "exit" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "exit" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     save_history(History),
     io:format("Goodbye!~n"),
     stop;
@@ -887,7 +862,7 @@ process_command(SessionId, History, "dump " ++ Args, Mode) ->
     dump_context(SessionId, History, Filename, Format),
     {continue, History, Mode};
 
-process_command(SessionId, History, "dump" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "dump" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~nUsage: /dump <filename> [format]~n"),
     io:format("  /dump context.md        - Dump full context to markdown~n"),
     io:format("  /dump context.json      - Dump full context to JSON~n"),
@@ -898,7 +873,7 @@ process_command(SessionId, History, "dump" ++ Rest, Mode) when Rest =:= []; hd(R
 
 
 %% Plan mode commands
-process_command(SessionId, History, "plan" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "plan" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~n╔════════════════════════════════════════════════════════════╗~n"),
     io:format("║                    ENTERING PLAN MODE                       ║~n"),
     io:format("╠════════════════════════════════════════════════════════════╣~n"),
@@ -918,7 +893,7 @@ process_command(SessionId, History, "plan" ++ Rest, _Mode) when Rest =:= []; hd(
     set_current_mode(plan),
     {continue, History, plan};
 
-process_command(SessionId, History, "build" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "build" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     CurrentPlan = get_current_plan(),
     set_current_mode(build),
     io:format("~n╔════════════════════════════════════════════════════════════╗~n"),
@@ -944,7 +919,7 @@ process_command(SessionId, History, "build" ++ Rest, _Mode) when Rest =:= []; hd
     io:format("╚════════════════════════════════════════════════════════════╝~n~n"),
     {continue, History, build};
 
-process_command(SessionId, History, "showplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "showplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     CurrentPlan = get_current_plan(),
     io:format("~n"),
     case byte_size(CurrentPlan) of
@@ -960,7 +935,7 @@ process_command(SessionId, History, "showplan" ++ Rest, Mode) when Rest =:= []; 
     end,
     {continue, History, Mode};
 
-process_command(SessionId, History, "editplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "editplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     % Create temp file with current plan
     TempFile = "/tmp/coding_agent_plan.md",
     CurrentPlan = get_current_plan(),
@@ -987,14 +962,14 @@ process_command(SessionId, History, "editplan" ++ Rest, Mode) when Rest =:= []; 
     end,
     {continue, History, Mode};
 
-process_command(SessionId, History, "clearplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "clearplan" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     set_current_plan(<<"">>),
     set_meticulous_steps([]),
     set_current_step_index(0),
     io:format("~n✓ Plan and steps cleared.~n~n"),
     {continue, History, Mode};
 
-process_command(SessionId, History, "meticulous" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "meticulous" ++ Rest, _Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     io:format("~n╔════════════════════════════════════════════════════════════╗~n"),
     io:format("║                 ENTERING METICULOUS MODE                    ║~n"),
     io:format("╠════════════════════════════════════════════════════════════╣~n"),
@@ -1015,7 +990,7 @@ process_command(SessionId, History, "meticulous" ++ Rest, _Mode) when Rest =:= [
     set_current_mode(meticulous),
     {continue, History, meticulous};
 
-process_command(SessionId, History, "steps" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "steps" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Steps = get_meticulous_steps(),
     CurrentIdx = get_current_step_index(),
     case Steps of
@@ -1050,9 +1025,9 @@ process_command(SessionId, History, "steps" ++ Rest, Mode) when Rest =:= []; hd(
     end,
     {continue, History, Mode};
 
-process_command(SessionId, History, "confirm" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+process_command(_SessionId, History, "confirm" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
     Steps = get_meticulous_steps(),
-    PlanText = get_current_plan(),
+    _PlanText = get_current_plan(),
     case Steps of
         [] ->
             io:format("~n~ts No steps defined yet.~n", [coding_agent_ansi:bright_red("✗")]),
@@ -1092,7 +1067,7 @@ process_command(SessionId, History, "exec" ++ Rest, Mode) when Rest =:= []; hd(R
             {continue, History, Mode}
     end;
 
-process_command(SessionId, History, "skip " ++ NumStr, Mode) ->
+process_command(_SessionId, History, "skip " ++ NumStr, Mode) ->
     case catch list_to_integer(string:trim(NumStr)) of
         Num when is_integer(Num), Num > 0 ->
             Steps = get_meticulous_steps(),
@@ -1239,7 +1214,7 @@ process_command(_SessionId, History, "mcp-resources" ++ Rest, Mode) when Rest =:
     {continue, History, Mode};
 
 
-process_command(SessionId, History, Unknown, Mode) ->
+process_command(_SessionId, History, Unknown, Mode) ->
     io:format("~ts /~s~n~ts~n~n", [coding_agent_ansi:bright_red("Unknown command:"), Unknown, coding_agent_ansi:dim("Type /help for available commands.")]),
     {continue, History, Mode}.
 
@@ -1261,7 +1236,7 @@ print_model_field(Map, Key, Label) ->
 process_message(SessionId, History, Input, Mode) ->
     process_message(SessionId, History, Input, Mode, 0).
 
-process_message(SessionId, History, Input, Mode, RetryCount) when RetryCount >= 3 ->
+process_message(_SessionId, History, _Input, Mode, RetryCount) when RetryCount >= 3 ->
     io:format("~n" ++ coding_agent_ansi:bright_red("Max retries exceeded. Please try again.") ++ "~n"),
     {continue, History, Mode};
 process_message(SessionId, History, Input, Mode, RetryCount) ->
@@ -1269,7 +1244,7 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
     NewHistory = [Input | History],
     
     % Get mode-specific system prompt
-    ModePrompt = get_mode_prompt(Mode),
+    _ModePrompt = get_mode_prompt(Mode),
     CurrentPlan = get_current_plan(),
     
     % Add mode and plan context to the message
@@ -1415,56 +1390,6 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
                 process_message(NewSessionId3, NewHistory, Input, Mode, 0)
     end.
 
-generate_crash_id() ->
-    <<A:32, B:32>> = crypto:strong_rand_bytes(8),
-    iolist_to_binary(io_lib:format("crash-~8.16.0b-~8.16.0b", [A, B])).
-
-generate_crash_report_content(CrashInfo) ->
-    Type = maps:get(type, CrashInfo, unknown),
-    Error = maps:get(error, CrashInfo, unknown),
-    Stacktrace = maps:get(stacktrace, CrashInfo, []),
-    SessionId = maps:get(session_id, CrashInfo, undefined),
-    Timestamp = maps:get(timestamp, CrashInfo, 0),
-    
-    SessionSection = case SessionId of
-        undefined -> <<"">>;
-        Sid -> io_lib:format("**Session ID:** ~s~n~n", [Sid])
-    end,
-    
-    ErrorStr = io_lib:format("~p", [Error]),
-    StackStr = format_stacktrace(Stacktrace),
-    
-    iolist_to_binary([
-        <<"# Crash Report~n~n">>,
-        io_lib:format("**Crash ID:** crash-~p~n~n", [Timestamp]),
-        io_lib:format("**Timestamp:** ~p (UTC)~n~n", [Timestamp]),
-        SessionSection,
-        <<"**Error Type:** ">>, atom_to_binary(Type, utf8), <<"~n~n">>,
-        <<"**Error:**~n~n```~n">>, ErrorStr, <<"~n```~n~n">>,
-        <<"**Stacktrace:**~n~n```~n">>, StackStr, <<"~n```~n">>
-    ]).
-
-format_stacktrace([]) -> <<"">>;
-format_stacktrace([{M, F, A, Info} | Rest]) when is_list(A) ->
-    Line = io_lib:format("  ~p:~p/~p at ~s:~p~n", [
-        M, F, length(A),
-        proplists:get_value(file, Info, "unknown"),
-        proplists:get_value(line, Info, 0)
-    ]),
-    [Line | format_stacktrace(Rest)];
-format_stacktrace([{M, F, A, Info} | Rest]) ->
-    Line = io_lib:format("  ~p:~p/~p at ~s:~p~n", [
-        M, F, A,
-        proplists:get_value(file, Info, "unknown"),
-        proplists:get_value(line, Info, 0)
-    ]),
-    [Line | format_stacktrace(Rest)];
-format_stacktrace([{M, F, A} | Rest]) ->
-    Line = io_lib:format("  ~p:~p/~p~n", [M, F, A]),
-    [Line | format_stacktrace(Rest)];
-format_stacktrace([_ | Rest]) ->
-    format_stacktrace(Rest).
-
 analyze_and_suggest_fix(Error2, Stacktrace2) ->
     %% Show the error clearly
     io:format("~n" ++ coding_agent_ansi:bright_red("** Error:") ++ " ~p~n", [Error2]),
@@ -1516,34 +1441,6 @@ find_function_in_modules(_WrongMod, Fun, Arity) ->
         [] -> not_found
     end.
 
-display_suggestion(CrashAnalysis) ->
-    case maps:get(suggested_fix, CrashAnalysis, #{}) of
-        #{hint := Hint} -> io:format(coding_agent_ansi:bright_cyan("Suggestion:") ++ " ~s~n", [Hint]);
-        _ -> ok
-    end.
-
-report_error(Reason) ->
-    % Don't log HTTP/API errors to crash report - they're handled by retry
-    case is_http_error(Reason) of
-        true ->
-            io:format(coding_agent_ansi:dim("(API error, will retry automatically)") ++ "~n");
-        false ->
-            io:format("Error: ~p~n", [Reason]),
-            case whereis(coding_agent_healer) of
-                undefined -> ok;
-                _ ->
-                    Stacktrace = try throw(fake) catch _:_:St -> St end,
-                    coding_agent_healer:report_crash(repl_error, Reason, Stacktrace),
-                    io:format(coding_agent_ansi:dim("Error logged.") ++ "~n")
-            end
-    end.
-
-is_http_error({http_error, _, _}) -> true;
-is_http_error({status, _, _}) -> true;
-is_http_error(max_retries_exceeded) -> true;
-is_http_error(timeout) -> true;
-is_http_error(_) -> false.
-
 report_crash(Type, Error, Stacktrace, SessionId) when is_binary(SessionId) ->
     case whereis(coding_agent_healer) of
         undefined -> ok;
@@ -1588,7 +1485,7 @@ dump_context(SessionId, History, Filename, Format0) ->
             io:format(coding_agent_ansi:bright_red("✗ Failed to write file:") ++ " ~p~n", [Reason])
     end.
 
-gather_context(SessionId, History) ->
+gather_context(SessionId, _History) ->
     #{
         session_id => SessionId,
         timestamp => erlang:system_time(millisecond),
@@ -1913,17 +1810,7 @@ print_map_indented(Map, Indent) when is_map(Map) ->
 print_map_indented(_, _) ->
     ok.
 
-print_response(<<>>) ->
-    ok;
-print_response(Content) when is_binary(Content) ->
-    Lines = binary:split(Content, <<"\n">>, [global]),
-    lists:foreach(fun(Line) ->
-        io:format("  ~s~n", [Line])
-    end, Lines);
-print_response(Content) ->
-    print_response(iolist_to_binary(Content)).
-
-stream_callback(Content, Thinking, #{thinking_shown := false}) when Thinking =/= <<>>, Thinking =/= undefined ->
+stream_callback(_Content, Thinking, #{thinking_shown := false}) when Thinking =/= <<>>, Thinking =/= undefined ->
     io:format("~s~s", [coding_agent_ansi:clear_line(), coding_agent_ansi:dim("Thinking...")]),
     io:format("~s", [coding_agent_ansi:clear_line()]),
     #{thinking_shown => true};

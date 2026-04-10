@@ -65,7 +65,7 @@ init([]) ->
     filelib:ensure_dir(OutputDir ++ "/"),
     {ok, #state{enabled = true, events = [], metrics = #{total_api_calls => 0, total_tool_calls => 0, total_tokens => 0, total_errors => 0, avg_api_latency_ms => 0.0}, output_dir = OutputDir}}.
 
-handle_cast({record, Type, Data}, State = #state{enabled = false}) ->
+handle_cast({record, _Type, _Data}, State = #state{enabled = false}) ->
     {noreply, State};
 
 handle_cast({record, Type, Data}, State = #state{enabled = true, events = Events, metrics = Metrics}) ->
@@ -122,9 +122,9 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 update_metrics(api_call, Data, Metrics) ->
-    Key = case maps:get(model, Data, undefined) of
+    _Key = case maps:get(model, Data, undefined) of
         undefined -> total_api_calls;
-        Model -> model_api_calls
+        _Model -> model_api_calls
     end,
     Metrics#{
         total_api_calls => maps:get(total_api_calls, Metrics, 0) + 1,
@@ -144,7 +144,7 @@ update_metrics(tool_call, Data, Metrics) ->
         tool_breakdown => NewToolBreakdown
     };
 
-update_metrics(error, Data, Metrics) ->
+update_metrics(error, _Data, Metrics) ->
     Metrics#{
         total_errors => maps:get(total_errors, Metrics, 0) + 1
     };
@@ -159,7 +159,7 @@ update_metrics(session_end, Data, Metrics) ->
         total_tokens => maps:get(total_tokens, Metrics, 0) + maps:get(total_tokens, Data, 0)
     };
 
-update_metrics(compaction, Data, Metrics) ->
+update_metrics(compaction, _Data, Metrics) ->
     Metrics#{
         total_compactions => maps:get(total_compactions, Metrics, 0) + 1
     };

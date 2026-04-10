@@ -1,7 +1,8 @@
 -module(coding_agent_ollama).
 -export([generate/2, generate_stream/2, chat/2, chat_with_tools/3, chat_stream/3, chat_stream/4]).
 -export([chat_with_tools_cancellable/4, chat_stream_cancellable/5]).
--export([chat_with_fallback/3, chat_with_fallback/4, is_retryable_error/1]).
+-export([chat_with_fallback/3, chat_with_fallback/4, is_retryable_error/1, is_context_error/1]).
+-export([lazy_compact_messages/2, compact_and_retry/5]).
 -export([chat_with_tools_streaming/4, chat_with_tools_streaming/5]).
 -export([count_tokens/1, count_tokens_detailed/1, count_tokens_accurate/2, truncate_messages/2]).
 -export([start_token_cache/0, clear_token_cache/0]).
@@ -59,7 +60,7 @@ get_token_cache() ->
 do_with_retry(Fun) ->
     do_with_retry(Fun, 0).
 
-do_with_retry(Fun, RetryCount) when RetryCount >= ?MAX_RETRIES ->
+do_with_retry(_Fun, RetryCount) when RetryCount >= ?MAX_RETRIES ->
     {error, max_retries_exceeded};
 do_with_retry(Fun, RetryCount) ->
     Delay = min(?RETRY_DELAY_BASE * round(math:pow(2, RetryCount)), ?RETRY_DELAY_MAX),
@@ -563,7 +564,7 @@ count_tokens_accurate(Model, Text) when is_binary(Text) ->
     end;
 count_tokens_accurate(Model, Text) when is_list(Text) ->
     count_tokens_accurate(Model, iolist_to_binary(Text));
-count_tokens_accurate(Model, Messages) when is_list(Messages) ->
+count_tokens_accurate(_Model, Messages) when is_list(Messages) ->
     %% For message lists, use estimate since API doesn't directly tokenize messages
     {ok, count_tokens(Messages)}.
 
@@ -631,6 +632,121 @@ is_retryable_error(Reason) ->
             _ -> false
         end
     end, Retryable).
+
+%% @doc Check if error is a context length exceeded error from Ollama.
+%% Context errors typically appear as HTTP 400 with messages containing
+%% keywords like "context", "token", "length", "exceed", etc.
+is_context_error({http_error, StatusCode, Body}) when StatusCode >= 400, StatusCode < 500 ->
+    try jsx:decode(Body, [return_maps]) of
+        #{<<"error">> := ErrorMsg} when is_binary(ErrorMsg) ->
+            ErrorLower = binary:lower(ErrorMsg),
+            ContextKeywords = [<<"context">>, <<"token">>, <<"length">>, 
+                               <<"exceed">>, <<"maximum">>, <<"limit">>, <<"too long">>],
+            lists:any(fun(Kw) -> 
+                binary:match(ErrorLower, Kw) =/= nomatch 
+            end, ContextKeywords);
+        _ -> false
+    catch _:_ -> false
+    end;
+is_context_error({error, Reason}) ->
+    is_context_error(Reason);
+is_context_error(_) -> false.
+
+%% @doc Compact messages lazily when context limit is exceeded.
+%% TargetRatio is the fraction of messages to keep (e.g., 0.5 keeps half).
+%% Preserves the first message (system prompt) and keeps the most recent messages.
+lazy_compact_messages(Messages, TargetRatio) when TargetRatio > 0, TargetRatio < 1 ->
+    TotalLen = length(Messages),
+    case TotalLen of
+        0 -> Messages;
+        1 -> Messages;
+        _ ->
+            KeepCount = max(2, round(TotalLen * TargetRatio)),  % At least 2: system + last
+            case Messages of
+                [First | Rest] when length(Rest) > KeepCount ->
+                    %% Keep first message and last N messages
+                    KeepFromEnd = KeepCount - 1,
+                    {ToDrop, ToKeep} = lists:split(length(Rest) - KeepFromEnd, Rest),
+                    io:format("[ollama] Compacting messages: dropping ~p older messages, keeping ~p recent + system~n", 
+                              [length(ToDrop), length(ToKeep)]),
+                    [First | ToKeep];
+                _ -> 
+                    %% Already small enough
+                    Messages
+            end
+    end;
+lazy_compact_messages(Messages, _) -> Messages.
+
+%% @doc Compact messages and retry on context length errors.
+%% This function implements lazy compaction: only compact when the API
+%% returns a context error. It progressively reduces context size until
+%% success or minimum size is reached.
+%%
+%% Parameters:
+%%   Model - the model to use
+%%   Messages - list of message maps
+%%   Tools - list of tool definitions
+%%   InitialRatio - starting ratio for compaction (e.g., 0.7 keeps 70%)
+%%   MinRatio - minimum ratio to try before giving up (e.g., 0.2)
+%%
+%% Returns:
+%%   {ok, Response} - successful response
+%%   {ok, Response, CompactionInfo} - success with compaction metadata
+%%   {error, Reason} - failure after all compaction attempts
+compact_and_retry(Model, Messages, Tools, InitialRatio, MinRatio) when is_binary(Model) ->
+    compact_and_retry_impl(Model, Messages, Tools, InitialRatio, MinRatio, []).
+
+compact_and_retry_impl(Model, Messages, Tools, _CurrentRatio, _MinRatio, CompactionLog) 
+    when length(Messages) < 3 ->
+    %% Not enough messages to compact further
+    case do_chat_with_tools(Model, Messages, Tools) of
+        {ok, Response} ->
+            {ok, Response, #{compactions => CompactionLog, final_messages => length(Messages)}};
+        {error, Reason} ->
+            {error, {context_exhausted, Reason, CompactionLog}}
+    end;
+compact_and_retry_impl(Model, Messages, Tools, CurrentRatio, MinRatio, CompactionLog) 
+    when CurrentRatio < MinRatio ->
+    %% Reached minimum ratio, try one last time
+    case do_chat_with_tools(Model, Messages, Tools) of
+        {ok, Response} ->
+            {ok, Response, #{compactions => CompactionLog, final_messages => length(Messages)}};
+        {error, Reason} ->
+            {error, {context_exhausted, Reason, CompactionLog}}
+    end;
+compact_and_retry_impl(Model, Messages, Tools, CurrentRatio, MinRatio, CompactionLog) ->
+    %% Try the request with current message set
+    case do_chat_with_tools(Model, Messages, Tools) of
+        {ok, Response} ->
+            %% Success! Return with compaction metadata if any
+            case CompactionLog of
+                [] -> {ok, Response};
+                _ -> {ok, Response, #{compactions => CompactionLog, final_messages => length(Messages)}}
+            end;
+        {error, Reason} ->
+            case is_context_error(Reason) of
+                true ->
+                    %% Context error - compact and retry
+                    io:format("[ollama] Context limit exceeded, compacting to ~p% (~p messages)~n",
+                              [round(CurrentRatio * 100), length(Messages)]),
+                    CompactedMessages = lazy_compact_messages(Messages, CurrentRatio),
+                    NewRatio = max(MinRatio, CurrentRatio * 0.7),  % Reduce by 30% each attempt
+                    NewLog = [{length(Messages), CurrentRatio} | CompactionLog],
+                    
+                    case length(CompactedMessages) == length(Messages) of
+                        true ->
+                            %% Compaction didn't change anything, we're stuck
+                            {error, {context_exhausted, Reason, CompactionLog}};
+                        false ->
+                            %% Retry with compacted messages
+                            compact_and_retry_impl(Model, CompactedMessages, Tools, 
+                                                   NewRatio, MinRatio, NewLog)
+                    end;
+                false ->
+                    %% Not a context error, propagate the error
+                    {error, Reason}
+            end
+    end.
 
 %% Get actual token count by making a minimal API call
 get_token_count_from_api(Model, Text) ->

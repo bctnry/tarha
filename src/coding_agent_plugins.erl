@@ -103,7 +103,7 @@ handle_call({execute, ToolName, Args}, _From, State = #state{plugins = Plugins, 
     {reply, Result, State};
 
 handle_call(list_plugins, _From, State = #state{plugins = Plugins}) ->
-    List = maps:fold(fun(Name, Plugin, Acc) ->
+    List = maps:fold(fun(_Name, Plugin, Acc) ->
         [#{
             name => Plugin#plugin.name,
             version => Plugin#plugin.version,
@@ -131,8 +131,7 @@ handle_call({disable, Name}, _From, State = #state{plugins = Plugins}) ->
     end,
     {reply, ok, State#state{plugins = NewPlugins}};
 
-handle_call({reload, Name}, _From, State) ->
-    NameBin = if is_list(Name) -> list_to_binary(Name); is_binary(Name) -> Name end,
+handle_call({reload, _Name}, _From, State) ->
     {Reply, NewState} = do_load_plugins(State),
     {reply, Reply, NewState};
 
@@ -165,7 +164,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %%===================================================================
 
-do_load_plugins(State = #state{workspace = Workspace}) ->
+do_load_plugins(_State = #state{workspace = Workspace}) ->
     PluginDirs = [
         filename:join(Workspace, ?PLUGIN_DIR),
         filename:join(code:priv_dir(coding_agent), "plugins")
@@ -204,7 +203,7 @@ load_plugin_from_dir(Dir) ->
                     <<"shell">> -> shell;
                     <<"module">> -> module;
                     <<"http">> -> http;
-                    Other -> shell
+                    _Other -> shell
                 end,
                 Command = binary_to_list(maps:get(<<"command">>, Decoded, <<>>)),
                 ModuleName = case maps:get(<<"module">>, Decoded, <<"">>) of
@@ -279,11 +278,11 @@ execute_module_tool(ToolName, Args, Plugin) ->
         end
     catch
         error:undef -> #{<<"success">> => false, <<"error">> => <<"Module not available">>};
-        Class:Reason:Stacktrace ->
+        Class:Reason:_Stacktrace ->
             #{<<"success">> => false, <<"error">> => list_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
     end.
 
-execute_http_tool(ToolName, Args, Plugin, Timeout) ->
+execute_http_tool(_ToolName, Args, Plugin, _Timeout) ->
     Url = Plugin#plugin.url,
     Headers = Plugin#plugin.headers,
     case coding_agent_tools_command:http_request(Url, Args, Headers) of

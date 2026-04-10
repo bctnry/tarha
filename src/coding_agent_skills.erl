@@ -222,7 +222,7 @@ skill_description(#{name := Name} = Skill) ->
         _ -> iolist_to_binary(Name)
     end.
 
-check_requirements(#{name := Name} = Skill) ->
+check_requirements(#{name := _Name} = Skill) ->
     Metadata = skill_metadata(Skill),
     Requires = maps:get(requires, Metadata, #{}),
     case Requires of
@@ -236,7 +236,7 @@ check_bins(Bins) when is_list(Bins) ->
     end, Bins);
 check_bins(_) -> true.
 
-missing_requirements(#{name := Name} = Skill) ->
+missing_requirements(#{name := _Name} = Skill) ->
     Metadata = skill_metadata(Skill),
     Requires = maps:get(requires, Metadata, #{}),
     MissingBins = case maps:get(bins, Requires, []) of
@@ -383,26 +383,3 @@ escape_xml(Bin) when is_binary(Bin) ->
 ensure_string(B) when is_binary(B) -> binary_to_list(B);
 ensure_string(L) when is_list(L) -> L.
 
-get_skills_context(SkillNames, State) ->
-    Content = lists:filtermap(fun(Name) ->
-        case do_load_skill(Name, State) of
-            <<>> -> false;
-            SkillContent ->
-                Stripped = strip_frontmatter(SkillContent),
-                {true, <<"### Skill: ", (iolist_to_binary(Name))/binary, "\n\n", Stripped/binary>>}
-        end
-    end, SkillNames),
-    case Content of
-        [] -> <<>>;
-        _ -> iolist_to_binary(lists:join(<<"\n\n---\n\n">>, Content))
-    end.
-
-strip_frontmatter(Content) ->
-    case binary:match(Content, <<"---">>) of
-        {0, _} ->
-            case binary:split(Content, <<"---">>, [global]) of
-                [_, _, Rest] -> binary:strip(Rest);
-                _ -> Content
-            end;
-        _ -> Content
-    end.

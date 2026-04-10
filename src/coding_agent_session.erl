@@ -734,7 +734,7 @@ serialize_results(Results) ->
         _:_ -> <<"[result serialization failed]">>
     end.
 
-limit_results(Results, MaxPerResult, MaxTotalSize) when is_list(Results) ->
+limit_results(Results, _MaxPerResult, MaxTotalSize) when is_list(Results) ->
     TotalSize = lists:foldl(fun(R, Acc) ->
         case R of
             #{<<"success">> := true, <<"output">> := Output} when is_binary(Output) ->
@@ -794,7 +794,7 @@ smart_truncate(Content, MaxSize) ->
 execute_single_tool_with_retry(TC, OpenFiles) ->
     execute_single_tool_with_retry(TC, OpenFiles, 0).
 
-execute_single_tool_with_retry(TC, OpenFiles, RetryCount) when RetryCount >= ?MAX_TOOL_RETRIES ->
+execute_single_tool_with_retry(_TC, OpenFiles, RetryCount) when RetryCount >= ?MAX_TOOL_RETRIES ->
     % Max retries reached, return failure
     {#{<<"success">> => false, <<"error">> => <<"Max retries exceeded">>}, OpenFiles};
 execute_single_tool_with_retry(TC, OpenFiles, RetryCount) ->
@@ -1062,7 +1062,21 @@ split_system_messages(Messages) ->
 %% Session compaction - summarize and archive old context
 %% Uses model's context_length from Ollama API for smarter compaction
 %% Three-level compaction: microcompact -> compact -> collapse
-maybe_compact_session(State = #state{prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, context_length = ContextLength}) ->
+%% NOTE: When lazy compaction is enabled, this function skips preemptive compaction
+%% and relies on compact_and_retry in coding_agent_ollama to handle context overflow on-demand.
+maybe_compact_session(State) ->
+    %% Check if lazy compaction is enabled - if so, skip preemptive compaction
+    case coding_agent_config:compaction_enabled() of
+        true ->
+            %% Lazy compaction enabled - let compact_and_retry handle it on error
+            State;
+        false ->
+            %% Preemptive compaction mode - compact before reaching context limit
+            do_preemptive_compact(State)
+    end.
+
+%% Internal function for preemptive compaction (old behavior)
+do_preemptive_compact(State = #state{prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, context_length = ContextLength}) ->
     TotalTokens = PT + CT + ET,
     Ratio = case ContextLength > 0 of
         true -> TotalTokens / ContextLength;
@@ -1290,8 +1304,21 @@ messages_to_text(Messages) ->
         <<Acc/binary, RoleStr/binary, Truncated/binary, "\n\n">>
     end, <<"">>, Messages).
 
+%% ============================================================================
+%% Lazy Compaction: Two-step comprehensive summarization
+%% ============================================================================
+
+-define(LAZY_COMPACT_FIRST_N, 8).  % Summarize first N messages
+-define(LAZY_COMPACT_TIMEOUT, 45000).  % 45 second timeout for two-step summarization
+
+
+
+
+
+
+
 %% Auto-save session (async)
-maybe_save_session(State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, tool_calls = TC, messages = Messages}) ->
+maybe_save_session(_State = #state{id = Id, model = Model, working_dir = WD, open_files = OpenFiles, prompt_tokens = PT, completion_tokens = CT, estimated_tokens = ET, tool_calls = TC, messages = Messages}) ->
     spawn(fun() ->
         SessionData = #{
             id => Id,

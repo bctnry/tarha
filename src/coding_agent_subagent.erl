@@ -141,7 +141,7 @@ handle_call(get_status, _From, State) ->
     },
     {reply, {ok, Status}, State};
 
-handle_call(await, From, State) ->
+handle_call(await, _From, State) ->
     case State#state.status of
         completed -> {reply, {ok, State#state.result}, State};
         failed -> {reply, {error, State#state.result}, State};
@@ -205,7 +205,7 @@ build_subagent_prompt(Mode, Description) ->
       "- If in plan mode, discuss your approach but do NOT execute any write operations\n"
       "- If in read-only mode, you can only read files and search, not modify anything\n">>.
 
-run_subagent(SessionId, SessionPid, Prompt, SystemPrompt, ToolDefs) ->
+run_subagent(SessionId, _SessionPid, Prompt, _SystemPrompt, ToolDefs) ->
     Mode = case ToolDefs of
         all -> build;
         Tools when is_list(Tools) ->

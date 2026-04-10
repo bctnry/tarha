@@ -161,7 +161,7 @@ do_rollback_latest(State) ->
         _ ->
             % Sort by timestamp (newest first)
             Sorted = lists:sort(fun({_, _, Ts1}, {_, _, Ts2}) -> Ts1 > Ts2 end, AllVersions),
-            [{M, Path, _} | _] = Sorted,
+            [{M, _Path, _} | _] = Sorted,
             do_rollback(M, State)
     end.
 
@@ -197,27 +197,6 @@ get_current_version_from_state(M, State) ->
     case Versions of
         [{Path, _} | _] -> Path;
         _ -> undefined
-    end.
-
-mod_info(M) ->
-    #{
-        name => M, 
-        loaded => code:is_loaded(M) =/= false,
-        path => case code:which(M) of 
-            non_existing -> undefined; 
-            P -> list_to_binary(P) 
-        end,
-        current_version => get_current_version(M)
-    }.
-
-get_current_version(M) ->
-    Versions = case whereis(?MODULE) of
-        undefined -> [];
-        _ -> gen_server:call(?MODULE, {get_versions, M})
-    end,
-    case Versions of
-        [{Path, _} | _] -> Path;
-        _ -> <<>>
     end.
 
 analyze() ->

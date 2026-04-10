@@ -91,11 +91,20 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-run_agent_loop(Model, Messages, Iteration) when Iteration >= ?MAX_ITERATIONS ->
+run_agent_loop(_Model, Messages, Iteration) when Iteration >= ?MAX_ITERATIONS ->
     {error, max_iterations_reached, Messages};
 run_agent_loop(Model, Messages, Iteration) ->
     Tools = coding_agent_tools:tools(),
-    case coding_agent_ollama:chat_with_tools(Model, Messages, Tools) of
+    CompactionEnabled = coding_agent_config:compaction_enabled(),
+    TargetRatio = coding_agent_config:compaction_target_ratio(),
+    MaxRetries = coding_agent_config:compaction_max_retries(),
+    Result = case CompactionEnabled of
+        true ->
+            coding_agent_ollama:compact_and_retry(Model, Messages, Tools, TargetRatio, MaxRetries);
+        false ->
+            coding_agent_ollama:chat_with_tools(Model, Messages, Tools)
+    end,
+    case Result of
         {ok, #{<<"message">> := ResponseMsg}} ->
             handle_response(Model, Messages, ResponseMsg, Iteration);
         {error, Reason} ->
@@ -131,7 +140,7 @@ handle_response(Model, Messages, #{<<"tool_calls">> := ToolCalls} = ResponseMsg,
             {error, Reason}
     end;
 
-handle_response(_Model, Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration) when Content =/= <<>>, Content =/= nil ->
+handle_response(_Model, _Messages, #{<<"content">> := Content} = ResponseMsg, _Iteration) when Content =/= <<>>, Content =/= nil ->
     Thinking = maps:get(<<"thinking">>, ResponseMsg, <<>>),
     {ok, Content, Thinking};
 

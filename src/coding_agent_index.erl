@@ -376,7 +376,7 @@ do_invalidate_file(FilePath, State) ->
 %% Internal: Erlang parsing
 %%===================================================================
 
-parse_erlang_module(FilePath, Content) ->
+parse_erlang_module(_FilePath, Content) ->
     Lines = binary:split(Content, <<"\n">>, [global]),
     ModuleName = extract_module_name(Lines),
     Exports = extract_exports(Lines),
@@ -539,7 +539,7 @@ extract_calls(ModuleName, Content) ->
 %% Internal: Elixir parsing
 %%===================================================================
 
-parse_elixir_module(FilePath, Content) ->
+parse_elixir_module(_FilePath, Content) ->
     Lines = binary:split(Content, <<"\n">>, [global]),
     ModuleName = extract_ex_module_name(Lines),
     Functions = extract_ex_functions(Lines),
@@ -708,7 +708,7 @@ search_fun_references(FunName, State) ->
     Pattern = <<FunBin/binary, "\\s*\\(">>,
     {ok, MP} = re:compile(Pattern),
     maps:fold(fun(FilePath, FileData, Acc) ->
-        Content = maps:get(content, FileData, <<>>),
+        _Content = maps:get(content, FileData, <<>>),
         %% Content might not be stored; read from disk
         case file:read_file(FilePath) of
             {ok, FileContent} ->
@@ -722,7 +722,7 @@ search_fun_references(FunName, State) ->
     end, [], State#state.file_index).
 
 rank_results(Query, Results, _Index) ->
-    QueryLower = string:lowercase(iolist_to_binary(Query)),
+    _QueryLower = string:lowercase(iolist_to_binary(Query)),
     Normalized = lists:map(fun
         ({File, Score}) when is_list(File), is_number(Score) -> {File, Score};
         ({File, _Symbol}) when is_list(File) -> {File, 1};

@@ -18,7 +18,11 @@
     get_retryable_errors/0,
     get_fallback_enabled/0,
     get_mcp_servers/0,
-    get_mcp_servers/1
+    get_mcp_servers/1,
+    %% Lazy compaction config
+    compaction_enabled/0,
+    compaction_target_ratio/0,
+    compaction_max_retries/0
 ]).
 
 %% @doc Centralized configuration for the coding agent.
@@ -112,6 +116,7 @@ apply_yaml_config(YamlDoc) when is_list(YamlDoc) ->
     Agent = proplists:get_value("agent", YamlDoc, []),
     Memory = proplists:get_value("memory", YamlDoc, []),
     Session = proplists:get_value("session", YamlDoc, []),
+    Compaction = proplists:get_value("compaction", YamlDoc, []),
 
     %% Apply ollama settings (only if not already set)
     maybe_set_env(coding_agent, model, proplists:get_value("model", Ollama)),
@@ -128,6 +133,11 @@ apply_yaml_config(YamlDoc) when is_list(YamlDoc) ->
 
     %% Apply session settings
     maybe_set_env(coding_agent, session_max_messages, proplists:get_value("max_messages", Session)),
+
+    %% Apply compaction settings
+    maybe_set_env(coding_agent, compaction_enabled, proplists:get_value("enabled", Compaction)),
+    maybe_set_env(coding_agent, compaction_target_ratio, proplists:get_value("target_ratio", Compaction)),
+    maybe_set_env(coding_agent, compaction_max_retries, proplists:get_value("max_retries", Compaction)),
 
     ok.
 
@@ -198,7 +208,11 @@ parse_yaml_value(<<"false">>) -> false;
 parse_yaml_value(Bin) ->
     case catch binary_to_integer(Bin) of
         Int when is_integer(Int) -> Int;
-        _ -> binary_to_list(Bin)
+        _ ->
+            case catch binary_to_float(Bin) of
+                Float when is_float(Float) -> Float;
+                _ -> binary_to_list(Bin)
+            end
     end.
 
 apply_simple_config([]) -> ok;
@@ -210,7 +224,10 @@ apply_simple_config([{Section, Key, Value} | Rest]) ->
         {"agent", "workspace"} => {coding_agent, workspace},
         {"memory", "max_size"} => {coding_agent, memory_max_size},
         {"memory", "consolidate_threshold"} => {coding_agent, memory_consolidate_threshold},
-        {"session", "max_messages"} => {coding_agent, session_max_messages}
+        {"session", "max_messages"} => {coding_agent, session_max_messages},
+        {"compaction", "enabled"} => {coding_agent, compaction_enabled},
+        {"compaction", "target_ratio"} => {coding_agent, compaction_target_ratio},
+        {"compaction", "max_retries"} => {coding_agent, compaction_max_retries}
     },
     case maps:get({Section, Key}, Mapping, undefined) of
         undefined -> ok;
@@ -384,3 +401,19 @@ normalize_mcp_config(Config) when is_map(Config) ->
     };
 normalize_mcp_config(_) ->
     #{}.
+
+%%===================================================================
+%% Lazy Compaction Configuration
+%%===================================================================
+
+-spec compaction_enabled() -> boolean().
+compaction_enabled() ->
+    application:get_env(coding_agent, compaction_enabled, true).
+
+-spec compaction_target_ratio() -> float().
+compaction_target_ratio() ->
+    application:get_env(coding_agent, compaction_target_ratio, 0.7).
+
+-spec compaction_max_retries() -> integer().
+compaction_max_retries() ->
+    application:get_env(coding_agent, compaction_max_retries, 3).
