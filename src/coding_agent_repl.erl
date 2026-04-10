@@ -57,6 +57,7 @@ start(_Args) ->
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/build") ++ A:dim("         - Exit plan mode, enter build mode") ++ A:bright_cyan("       ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/showplan") ++ A:dim("      - Show current plan") ++ A:bright_cyan("                      ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/editplan") ++ A:dim("      - Edit plan in editor") ++ A:bright_cyan("                    ║")]),
+        io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/cwd") ++ A:dim("            - Show current working directory") ++ A:bright_cyan("        ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/quit, /exit") ++ A:dim("   - Exit the REPL") ++ A:bright_cyan("                          ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/mcp") ++ A:dim("            - List MCP servers") ++ A:bright_cyan("                         ║")]),
         io:format("~ts~n", [A:bright_cyan("║   ") ++ A:bright_white("/mcp-add <n>") ++ A:dim("  - Add MCP server") ++ A:bright_cyan("                             ║")]),
@@ -340,6 +341,7 @@ process_command(SessionId, History, "help" ++ Rest, Mode) when Rest =:= []; hd(R
     io:format("  " ++ coding_agent_ansi:bright_white("/mcp-add <cfg>") ++ coding_agent_ansi:dim("    - Add MCP server from config") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/mcp-remove <n>") ++ coding_agent_ansi:dim(" - Remove MCP server") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/mcp-tools") ++ coding_agent_ansi:dim("        - List MCP tools") ++ "~n"),
+    io:format("  " ++ coding_agent_ansi:bright_white("/cwd") ++ coding_agent_ansi:dim("            - Show current working directory") ++ "~n"),
     io:format("  " ++ coding_agent_ansi:bright_white("/quit, /exit") ++ coding_agent_ansi:dim("    - Exit REPL") ++ "~n"),
     io:format("~n" ++ coding_agent_ansi:bright_yellow("Current mode:") ++ " ~s~n", [get_mode_indicator(Mode)]),
     {continue, History, Mode};
@@ -838,6 +840,11 @@ process_command(SessionId, History, "save" ++ Rest, Mode) when Rest =:= []; hd(R
         {error, Reason} ->
             io:format("✗ Failed to save session: ~p~n~n", [Reason])
     end,
+    {continue, History, Mode};
+
+process_command(_SessionId, History, "cwd" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
+    {ok, Cwd} = file:get_cwd(),
+    io:format("~ts~n", [Cwd]),
     {continue, History, Mode};
 
 process_command(_SessionId, History, "quit" ++ Rest, Mode) when Rest =:= []; hd(Rest) =:= $\s; hd(Rest) =:= $\t ->
