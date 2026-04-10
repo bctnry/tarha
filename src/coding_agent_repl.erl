@@ -1958,28 +1958,25 @@ load_mcp_servers() ->
             end, Servers)
     end.
 
--define(SPINNER_FRAMES, ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⦶", "⠦"]).
--define(SPINNER_INTERVAL, 80).
+-define(SPINNER_INTERVAL, 100).
 
 start_spinner() ->
-    Parent = self(),
-    Ref = make_ref(),
-    Pid = spawn(fun() -> spinner_loop(Parent, Ref, ?SPINNER_FRAMES, 0, erlang:monotonic_time(millisecond)) end),
-    Pid.
+    io:format("~s", [coding_agent_ansi:dim("  Waiting for response...")]),
+    spawn(fun() -> spinner_dots(1, erlang:monotonic_time(millisecond)) end).
 
-spinner_loop(Parent, Ref, Frames, Idx, StartTime) ->
-    Frame = lists:nth((Idx rem length(Frames)) + 1, Frames),
-    Elapsed = (erlang:monotonic_time(millisecond) - StartTime) div 1000,
-    io:format("\r~s ~ts ~s ~ps", [coding_agent_ansi:bright_cyan(Frame), coding_agent_ansi:dim("waiting for response"), coding_agent_ansi:dim(coding_agent_ansi:clear_line()), Elapsed]),
+spinner_dots(N, StartTime) ->
     receive
         stop -> ok
     after ?SPINNER_INTERVAL ->
-        spinner_loop(Parent, Ref, Frames, Idx + 1, StartTime)
+        Elapsed = (erlang:monotonic_time(millisecond) - StartTime) div 1000,
+        Dots = lists:duplicate(N rem 4 + 1, "."),
+        io:format("~s~s~s ~Bs", [coding_agent_ansi:clear_line(), coding_agent_ansi:dim("  Waiting for response"), Dots, Elapsed]),
+        spinner_dots(N + 1, StartTime)
     end.
 
 stop_spinner(Pid) when is_pid(Pid) ->
     Pid ! stop,
-    io:format("\r~s", [coding_agent_ansi:clear_line()]),
+    io:format("~s", [coding_agent_ansi:clear_line()]),
     ok;
 stop_spinner(_) ->
     ok.
