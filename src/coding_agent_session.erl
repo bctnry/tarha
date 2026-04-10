@@ -380,6 +380,19 @@ handle_call({ask, Message, _Opts}, _From, State) ->
             end
     end;
 
+handle_call({ask_stream, Message, Callback, _Opts}, _From, State) ->
+    case check_budget_exceeded(State) of
+        true ->
+            {reply, {error, budget_exceeded}, State};
+        false ->
+            case check_tool_budget_exceeded(State) of
+                true ->
+                    {reply, {error, tool_budget_exceeded}, State};
+                false ->
+                    do_ask_stream(Message, Callback, State)
+            end
+    end;
+
 handle_call(history, _From, State = #state{messages = Messages}) ->
     {reply, {ok, Messages}, State};
 
@@ -1375,6 +1388,70 @@ do_ask(Message, State = #state{model = Model, messages = History, working_dir = 
             CompactedState = maybe_compact_session(NewState),
             maybe_save_session(CompactedState),
             {reply, {ok, Response, Thinking, ReplyHistory}, CompactedState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end.
+
+do_ask_stream(Message, Callback, State = #state{model = Model, messages = History, working_dir = WD, id = Id, open_files = OpenFiles}) ->
+    MsgBin = iolist_to_binary(Message),
+    WDBin = list_to_binary(WD),
+    FileContext = build_file_context(OpenFiles),
+    MemoryContext = get_memory_context(),
+    SkillsContext = get_skills_context(),
+    AgentsContext = get_agents_context(),
+    CrashContext = get_recent_crash_context(),
+    BasePrompt = <<?SYSTEM_PROMPT/binary, "\n\nCurrent working directory: ", WDBin/binary, "\nSession ID: ", Id/binary>>,
+    WithAgents = case AgentsContext of
+        <<>> -> BasePrompt;
+        _ -> <<BasePrompt/binary, "\n\n# Project Context (AGENTS.md)\n\n", AgentsContext/binary>>
+    end,
+    WithMemory = case MemoryContext of
+        <<>> -> WithAgents;
+        _ -> <<WithAgents/binary, "\n\n", MemoryContext/binary>>
+    end,
+    WithSkills = case SkillsContext of
+        <<>> -> WithMemory;
+        _ -> <<WithMemory/binary, "\n\n# Available Skills\n\nSkills are available. Use read_file on skill's SKILL.md to load full instructions.\n\n", SkillsContext/binary>>
+    end,
+    WithFiles = case FileContext of
+        <<>> -> WithSkills;
+        _ -> <<WithSkills/binary, "\n\nOpen files (cached in context):\n", FileContext/binary>>
+    end,
+    SystemContent = case CrashContext of
+        <<>> -> WithFiles;
+        _ -> <<WithFiles/binary, "\n\n", ?HEAL_PROMPT/binary, "\n\n", CrashContext/binary>>
+    end,
+    SystemMsg = #{<<"role">> => <<"system">>, <<"content">> => SystemContent},
+    UserMsg = #{<<"role">> => <<"user">>, <<"content">> => MsgBin},
+    ExistingHistory = strip_system_messages(trim_history(History)),
+    Messages = [SystemMsg | ExistingHistory] ++ [UserMsg],
+    case run_agent_loop(Model, Messages, 0, OpenFiles, Id) of
+        {ok, Response, Thinking, NewHistory, FinalOpenFiles, TokenInfo} ->
+            Callback(Response, Thinking, #{thinking_shown => content}),
+            FinalHistory = strip_system_messages(trim_history(NewHistory)),
+            PromptUsed = maps:get(prompt_tokens, TokenInfo, 0),
+            CompletionUsed = maps:get(completion_tokens, TokenInfo, 0),
+            EstimatedUsed = maps:get(estimated_tokens, TokenInfo, 0),
+            NewState = State#state{
+                messages = FinalHistory,
+                open_files = FinalOpenFiles,
+                prompt_tokens = State#state.prompt_tokens + PromptUsed,
+                completion_tokens = State#state.completion_tokens + CompletionUsed,
+                estimated_tokens = State#state.estimated_tokens + EstimatedUsed,
+                tool_calls = State#state.tool_calls + 1,
+                budget_used = State#state.budget_used + PromptUsed + CompletionUsed + EstimatedUsed,
+                tool_calls_remaining = max(State#state.tool_calls_remaining - 1, 0)
+            },
+            case check_budget_warning(NewState) of
+                true when State#state.budget_limit > 0 ->
+                    BudgetPct = (NewState#state.budget_used * 100) div State#state.budget_limit,
+                    io:format("[session] WARNING: Budget usage at ~p%~n", [BudgetPct]);
+                _ -> ok
+            end,
+            maybe_trigger_consolidation(),
+            CompactedState = maybe_compact_session(NewState),
+            maybe_save_session(CompactedState),
+            {reply, {ok, Response, Thinking}, CompactedState};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end.
