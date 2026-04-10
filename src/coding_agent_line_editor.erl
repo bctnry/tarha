@@ -28,6 +28,27 @@ read_line(Prompt, History) ->
 
 %% @doc Read a line with prompt, history, and initial content
 read_line(Prompt, History, Initial) ->
+    case has_tty() of
+        true -> fancy_read_line(Prompt, History, Initial);
+        false -> simple_read_line(Prompt, History)
+    end.
+
+simple_read_line(Prompt, _History) ->
+    io:format("~ts", [Prompt]),
+    case io:get_line("") of
+        eof -> {error, eof};
+        Line when is_list(Line) ->
+            {ok, string:trim(Line, trailing, "\n\r")};
+        _ -> {error, unknown}
+    end.
+
+has_tty() ->
+    case io:columns() of
+        {ok, _} -> true;
+        _ -> false
+    end.
+
+fancy_read_line(Prompt, History, Initial) ->
     % Initialize history navigation state
     put(?HIST_INDEX, -1),  % -1 means not navigating history
     put(?HIST_SAVED, Initial),
