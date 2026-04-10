@@ -1961,17 +1961,16 @@ load_mcp_servers() ->
 -define(SPINNER_INTERVAL, 100).
 
 start_spinner() ->
-    io:format("~s", [coding_agent_ansi:dim("  Waiting for response...")]),
-    spawn(fun() -> spinner_dots(1, erlang:monotonic_time(millisecond)) end).
+    spawn(fun() -> spinner_loop(0, erlang:monotonic_time(millisecond)) end).
 
-spinner_dots(N, StartTime) ->
+spinner_loop(N, StartTime) ->
     receive
         stop -> ok
     after ?SPINNER_INTERVAL ->
         Elapsed = (erlang:monotonic_time(millisecond) - StartTime) div 1000,
         Dots = lists:duplicate(N rem 4 + 1, "."),
-        io:format("~s~s~s ~Bs", [coding_agent_ansi:clear_line(), coding_agent_ansi:dim("  Waiting for response"), Dots, Elapsed]),
-        spinner_dots(N + 1, StartTime)
+        io:format("~s~s~ts~s~B s", [coding_agent_ansi:clear_line(), coding_agent_ansi:dim("  Waiting for response"), Dots, lists:duplicate(5 - length(Dots), " "), Elapsed]),
+        spinner_loop(N + 1, StartTime)
     end.
 
 stop_spinner(Pid) when is_pid(Pid) ->
