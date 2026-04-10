@@ -16,6 +16,26 @@
 -define(STEPS_KEY, {coding_agent_repl, meticulous_steps}).
 -define(STEP_INDEX_KEY, {coding_agent_repl, current_step}).
 -define(PLAN_DIR, ".tarha/plans").
+-define(MENU_WIDTH, 60).
+
+%% Helper to calculate visible string length (excluding ANSI codes)
+visible_length(Str) when is_binary(Str) ->
+    visible_length(binary_to_list(Str));
+visible_length(Str) when is_list(Str) ->
+    % Remove ANSI escape sequences for length calculation
+    NoAnsi = re:replace(Str, "\e\[[0-9;]*m", "", [global, {return, list}]),
+    length(unicode:characters_to_list(NoAnsi, utf8)).
+
+%% Helper to pad a string to a specific width
+pad_to_width(Str, Width) ->
+    VisibleLen = visible_length(Str),
+    Padding = max(0, Width - VisibleLen),
+    Str ++ lists:duplicate(Padding, $\s).
+
+%% Helper to create a menu line with proper padding
+menu_line(Content) ->
+    A = coding_agent_ansi,
+    A:bright_cyan("║ ") ++ pad_to_width(Content, ?MENU_WIDTH - 4) ++ A:bright_cyan(" ║").
 
 start() ->
     start([]).
@@ -205,17 +225,9 @@ get_mode_indicator(meticulous) ->
 
 loop(SessionId, History, Mode) ->
     Prompt = get_mode_prompt(Mode),
-    io:format("~ts", [Prompt]),
     flush_pending_output(),
-    case file:read_line(standard_io) of
-        eof ->
-            io:format("~n~s~n", [coding_agent_ansi:bright_cyan("Goodbye!")]),
-            save_history(History),
-            ok;
-        {error, Reason} ->
-            io:format("~ts ~p~n", [coding_agent_ansi:bright_red("Input error:"), Reason]),
-            save_history(History),
-            ok;
+    % Use line editor with history support
+    case coding_agent_line_editor:read_line(Prompt, History) of
         {ok, Line} ->
             Input = sanitize_input(Line),
             case Input of
@@ -228,9 +240,18 @@ loop(SessionId, History, Mode) ->
                         {new_session, NewSessionId, NewHistory, NewMode} ->
                             ?MODULE:loop(NewSessionId, NewHistory, NewMode);
                         stop ->
+                            save_history(History),
                             ok
                     end
-            end
+            end;
+        {error, eof} ->
+            io:format("~n~s~n", [coding_agent_ansi:bright_cyan("Goodbye!")]),
+            save_history(History),
+            ok;
+        {error, Reason} ->
+            io:format("~ts ~p~n", [coding_agent_ansi:bright_red("Input error:"), Reason]),
+            save_history(History),
+            ok
     end.
 
 sanitize_input(Line) ->
@@ -1312,10 +1333,9 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
     EnrichedMessage = iolist_to_binary([ModeContext, Message]),
     
     try
-        SpinnerPid = start_spinner(),
-        Result = try
-            StreamCb = fun stream_callback/3,
-            case coding_agent_session:ask_stream(SessionId, EnrichedMessage, StreamCb) of
+        io:format("~s", [coding_agent_ansi:dim("  Waiting for response...~n")]),
+        StreamCb = fun stream_callback/3,
+        case coding_agent_session:ask_stream(SessionId, EnrichedMessage, StreamCb) of
                 {ok, Response, _Thinking} ->
                     io:format("~n"),
                     case Mode of
@@ -1393,14 +1413,6 @@ process_message(SessionId, History, Input, Mode, RetryCount) ->
                 {ok, {NewSessionId3, _}} = coding_agent_session:new(),
                 io:format("New session: ~ts~n~n", [coding_agent_ansi:bright_magenta(NewSessionId3)]),
                 process_message(NewSessionId3, NewHistory, Input, Mode, 0)
-        after
-            stop_spinner(SpinnerPid)
-        end,
-        Result
-    catch
-        Type:Error:Stacktrace ->
-            io:format("~n~s ~p:~p~n", [coding_agent_ansi:bright_red("** Command crashed:"), Type, Error]),
-            {continue, History, Mode}
     end.
 
 generate_crash_id() ->
@@ -1957,25 +1969,3 @@ load_mcp_servers() ->
                 end
             end, Servers)
     end.
-
--define(SPINNER_INTERVAL, 100).
-
-start_spinner() ->
-    spawn(fun() -> spinner_loop(0, erlang:monotonic_time(millisecond)) end).
-
-spinner_loop(N, StartTime) ->
-    receive
-        stop -> ok
-    after ?SPINNER_INTERVAL ->
-        Elapsed = (erlang:monotonic_time(millisecond) - StartTime) div 1000,
-        Dots = lists:duplicate(N rem 4 + 1, "."),
-        io:format("~s~s~ts~s~B s", [coding_agent_ansi:clear_line(), coding_agent_ansi:dim("  Waiting for response"), Dots, lists:duplicate(5 - length(Dots), " "), Elapsed]),
-        spinner_loop(N + 1, StartTime)
-    end.
-
-stop_spinner(Pid) when is_pid(Pid) ->
-    Pid ! stop,
-    io:format("~s", [coding_agent_ansi:clear_line()]),
-    ok;
-stop_spinner(_) ->
-    ok.
